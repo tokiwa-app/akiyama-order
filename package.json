@@ -1,11 +1,12 @@
-import express from "express";
-const app = express();
-
-app.get("/", (req, res) => {
-  res.send("Hello Akiyama Order!");
-});
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`Listening on port ${port}`);
-});
+{
+  "name": "akiyama-order",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
