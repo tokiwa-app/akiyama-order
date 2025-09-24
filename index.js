@@ -1,6 +1,7 @@
 // index.js
 // Cloud Run: Gmail Push を受けて Firestore / Cloud Storage に保存
-// さらに Web OAuth で /oauth2/start → /oauth2/callback から watch を開始できます。
+// Web OAuth で /oauth2/start → /oauth2/callback から watch を開始
+// watch の期限更新は /gmail/watch/renew で可能
 
 import express from "express";
 import { google } from "googleapis";
@@ -8,18 +9,14 @@ import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
 
 // ==== 環境変数 ====
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined; // 例: tokiwa-cloud-auth-25c0c
-const GCS_BUCKET = process.env.GCS_BUCKET || "";                          // 例: tokiwa-cloud-auth-25c0c.appspot.com
-
-// OAuth（Web）
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
+const GCS_BUCKET = process.env.GCS_BUCKET || "";
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ||
-  "https://akiyama-order-153993420990.asia-northeast2.run.app/oauth2/callback";
-
-// Pub/Sub topic（Gmail Push 宛先）
-const GMAIL_TOPIC = "projects/tokiwa-cloud-auth-25c0c/topics/gmail-inbox";
+  "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
+const GMAIL_TOPIC = "projects/<PROJECT_ID>/topics/gmail-inbox";
 
 // ==== 初期化 ====
 const app = express();
@@ -59,7 +56,7 @@ function extractBodies(payload) {
   return { textPlain, textHtml };
 }
 
-// ==== OAuth リフレッシュトークンの取得/保存（Firestore にも保存）====
+// ==== OAuth リフレッシュトークン保存 ====
 let cachedRefreshToken = process.env.OAUTH_REFRESH_TOKEN || null;
 
 async function getStoredRefreshToken() {
@@ -69,7 +66,6 @@ async function getStoredRefreshToken() {
   if (tok) cachedRefreshToken = tok;
   return cachedRefreshToken;
 }
-
 async function storeRefreshToken(token) {
   cachedRefreshToken = token || cachedRefreshToken;
   if (!token) return;
@@ -80,8 +76,6 @@ async function storeRefreshToken(token) {
 }
 
 // ==== Gmail クライアント ====
-// 1) OAUTH_CLIENT_ID/SECRET が設定されており、Refresh Token が Firestore or env にあれば OAuth を使用
-// 2) なければ ADC（Cloud Run 実行 SA）で試行（Workspace + DWD 向け）
 async function getGmail() {
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET) {
     const refresh = await getStoredRefreshToken();
@@ -107,7 +101,8 @@ async function saveAttachmentToGCS(userEmail, messageId, part) {
     messageId,
     id: attachId,
   });
-  const bytes = Buffer.from(res.data.data, "base64");
+  const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
+  const bytes = Buffer.from(b64, "base64");
   const filename = part.filename || `attachment-${attachId}`;
   const objectPath = `gmail/${encodeURIComponent(userEmail)}/${messageId}/${filename}`;
   await bucket.file(objectPath).save(bytes, {
@@ -120,46 +115,58 @@ async function saveAttachmentToGCS(userEmail, messageId, part) {
 // ==== Gmail History 差分処理 ====
 async function handleHistory(emailAddress, historyId) {
   const gmail = await getGmail();
-
   const userDoc = db.collection("gmail_users").doc(emailAddress);
   const snap = await userDoc.get();
   const lastHistoryId = snap.exists ? snap.data().lastHistoryId : null;
 
-  // 初回は起点だけ保存
   if (!lastHistoryId) {
     await userDoc.set({ lastHistoryId: historyId, updatedAt: Date.now() }, { merge: true });
     console.log(`[INIT] historyId=${historyId} saved for ${emailAddress}`);
     return;
   }
 
-  // 差分列挙
   const newIds = new Set();
   let pageToken;
-  do {
-    const r = await gmail.users.history.list({
-      userId: "me",
-      startHistoryId: lastHistoryId,
-      historyTypes: ["messageAdded"],
-      pageToken,
-    });
-    pageToken = r.data.nextPageToken || null;
-    for (const h of r.data.history || []) {
-      for (const ma of h.messagesAdded || []) {
-        if (ma.message?.id) newIds.add(ma.message.id);
+  try {
+    do {
+      const r = await gmail.users.history.list({
+        userId: "me",
+        startHistoryId: lastHistoryId,
+        historyTypes: ["messageAdded"],
+        pageToken,
+      });
+      pageToken = r.data.nextPageToken || null;
+      for (const h of r.data.history || []) {
+        for (const ma of h.messagesAdded || []) {
+          if (ma.message?.id) newIds.add(ma.message.id);
+        }
       }
+    } while (pageToken);
+  } catch (err) {
+    if (err?.code === 404) {
+      console.warn("History too old. Doing backfill...");
+      let listPageToken;
+      do {
+        const lr = await gmail.users.messages.list({
+          userId: "me",
+          q: "newer_than:30d in:inbox",
+          pageToken: listPageToken,
+          maxResults: 200,
+        });
+        listPageToken = lr.data.nextPageToken || null;
+        for (const m of lr.data.messages || []) {
+          if (m.id) newIds.add(m.id);
+        }
+      } while (listPageToken);
+    } else {
+      throw err;
     }
-  } while (pageToken);
+  }
 
   console.log(`Found ${newIds.size} new messages since ${lastHistoryId} for ${emailAddress}`);
 
-  // 取得→保存
   for (const id of newIds) {
-    const m = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-
+    const m = await gmail.users.messages.get({ userId: "me", id, format: "full" });
     const payload = m.data.payload;
     const headers = payload?.headers || [];
     const subject = getHeader(headers, "Subject");
@@ -168,10 +175,8 @@ async function handleHistory(emailAddress, historyId) {
     const cc = getHeader(headers, "Cc");
     const dateHdr = getHeader(headers, "Date");
     const internalDateMs = m.data.internalDate ? Number(m.data.internalDate) : Date.parse(dateHdr);
-
     const { textPlain, textHtml } = extractBodies(payload);
 
-    // 添付
     const attachments = [];
     const parts = flattenParts(payload?.parts || []);
     for (const p of parts) {
@@ -181,7 +186,6 @@ async function handleHistory(emailAddress, historyId) {
       }
     }
 
-    // Firestore（冪等）
     await db.collection("messages").doc(id).set(
       {
         user: emailAddress,
@@ -206,7 +210,6 @@ async function handleHistory(emailAddress, historyId) {
     console.log(`Saved message ${id} (attachments: ${attachments.length})`);
   }
 
-  // 起点更新
   await userDoc.set({ lastHistoryId: historyId, updatedAt: Date.now() }, { merge: true });
 }
 
@@ -251,7 +254,7 @@ app.get("/oauth2/start", async (_req, res) => {
   }
 });
 
-// OAuth: 同意後コールバック（Refresh Token を Firestore に保存し、watch 開始）
+// OAuth: コールバック
 app.get("/oauth2/callback", async (req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) return res.status(400).send("OAuth client not set");
@@ -276,6 +279,13 @@ app.get("/oauth2/callback", async (req, res) => {
       },
     });
 
+    const profile = await gmail.users.getProfile({ userId: "me" });
+    await db.collection("gmail_users").doc(profile.data.emailAddress).set({
+      lastHistoryId: watchRes.data.historyId || null,
+      watchExpiration: watchRes.data.expiration || null,
+      updatedAt: Date.now(),
+    }, { merge: true });
+
     res.set("Content-Type", "text/plain");
     res.send(
       `OK\nstored_refresh_token=${tokens.refresh_token ? "yes" : "no"}\nwatch historyId=${watchRes.data.historyId || "(none)"}\n`
@@ -283,6 +293,31 @@ app.get("/oauth2/callback", async (req, res) => {
   } catch (e) {
     console.error("oauth2/callback error", e);
     res.status(500).send("oauth callback error");
+  }
+});
+
+// watch 更新
+app.post("/gmail/watch/renew", async (_req, res) => {
+  try {
+    const gmail = await getGmail();
+    const profile = await gmail.users.getProfile({ userId: "me" });
+    const watchRes = await gmail.users.watch({
+      userId: "me",
+      requestBody: {
+        topicName: GMAIL_TOPIC,
+        labelIds: ["INBOX"],
+        labelFilterAction: "include",
+      },
+    });
+    await db.collection("gmail_users").doc(profile.data.emailAddress).set({
+      lastHistoryId: watchRes.data.historyId || null,
+      watchExpiration: watchRes.data.expiration || null,
+      updatedAt: Date.now(),
+    }, { merge: true });
+    res.status(200).send("renewed");
+  } catch (e) {
+    console.error("watch renew error", e);
+    res.status(500).send("renew error");
   }
 });
 
