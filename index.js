@@ -16,7 +16,7 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ||
   "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
-const GMAIL_TOPIC = "projects/<PROJECT_ID>/topics/gmail-inbox";
+const GMAIL_TOPIC = "projects/tokiwa-cloud-auth-25c0c/topics/gmail-inbox";
 
 // ==== 初期化 ====
 const app = express();
