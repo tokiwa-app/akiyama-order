@@ -137,11 +137,11 @@ async function handleHistory(emailAddress, historyId) {
       (x) => x.name?.toLowerCase() === "from"
     )?.value || "");
 
-    // === 分岐: FAXメール or 通常メール ===
+    // === 分岐: FAXメール or 通常メール（gmail を渡す以外は最小変更） ===
     if (from.includes("akiyama.order@gmail.com")) {
-      await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET);
+      await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
     } else {
-      await handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET);
+      await handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
     }
   }
 
