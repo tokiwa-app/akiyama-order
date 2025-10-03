@@ -1,7 +1,7 @@
 // mailHandler.js
 import { bucket } from "./index.js";
 
-// ==== ユーティリティ関数 ====
+// ==== 便利関数（このファイル内に内蔵） ====
 function getHeader(headers, name) {
   const h = (headers || []).find(
     (x) => x.name?.toLowerCase() === name.toLowerCase()
@@ -26,35 +26,55 @@ function extractBodies(payload) {
   if (!payload) return { textPlain, textHtml };
   const parts = payload.parts ? flattenParts(payload.parts) : [payload];
   for (const p of parts) {
-    if (p.mimeType === "text/plain" && p.body?.data)
-      textPlain += Buffer.from(p.body.data, "base64").toString("utf8");
-    if (p.mimeType === "text/html" && p.body?.data)
-      textHtml += Buffer.from(p.body.data, "base64").toString("utf8");
+    if (p.mimeType === "text/plain" && p.body?.data) {
+      textPlain += Buffer.from(
+        p.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64"
+      ).toString("utf8");
+    }
+    if (p.mimeType === "text/html" && p.body?.data) {
+      textHtml += Buffer.from(
+        p.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64"
+      ).toString("utf8");
+    }
   }
   return { textPlain, textHtml };
 }
 
-async function saveAttachmentToGCS(userEmail, messageId, part, GCS_BUCKET) {
+// Gmail API から attachmentId を使って添付を取得して保存
+async function saveAttachmentToGCSViaAPI({
+  userEmail,
+  messageId,
+  part,
+  gmail,
+  GCS_BUCKET,
+}) {
   if (!bucket) return null;
   const attachId = part?.body?.attachmentId;
   if (!attachId) return null;
-  const b64 = (part.body.data || "")
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
+
+  const res = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachId,
+  });
+
+  const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
   const bytes = Buffer.from(b64, "base64");
   const filename = part.filename || `attachment-${attachId}`;
-  const objectPath = `gmail/${encodeURIComponent(
-    userEmail
-  )}/${messageId}/${filename}`;
+  const objectPath = `gmail/${encodeURIComponent(userEmail)}/${messageId}/${filename}`;
+
   await bucket.file(objectPath).save(bytes, {
     resumable: false,
     metadata: { contentType: part.mimeType || "application/octet-stream" },
   });
+
   return `gs://${GCS_BUCKET}/${objectPath}`;
 }
 
 // ==== 通常メール処理 ====
-export async function handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET) {
+export async function handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET, gmail) {
   const headers = payload?.headers || [];
   const subject = getHeader(headers, "Subject");
   const from = getHeader(headers, "From");
@@ -71,12 +91,13 @@ export async function handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET)
   const parts = flattenParts(payload?.parts || []);
   for (const p of parts) {
     if (p?.filename && p.body?.attachmentId) {
-      const path = await saveAttachmentToGCS(
-        emailAddress,
-        m.data.id,
-        p,
-        GCS_BUCKET
-      );
+      const path = await saveAttachmentToGCSViaAPI({
+        userEmail: emailAddress,
+        messageId: m.data.id,
+        part: p,
+        gmail,
+        GCS_BUCKET,
+      });
       if (path) attachments.push(path);
     }
   }
