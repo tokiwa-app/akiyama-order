@@ -1,7 +1,7 @@
 // faxHandler.js
 import { bucket } from "./index.js";
 
-// ==== ユーティリティ関数 ==== 
+// ==== 便利関数（このファイル内に内蔵） ====
 function getHeader(headers, name) {
   const h = (headers || []).find(
     (x) => x.name?.toLowerCase() === name.toLowerCase()
@@ -26,35 +26,83 @@ function extractBodies(payload) {
   if (!payload) return { textPlain, textHtml };
   const parts = payload.parts ? flattenParts(payload.parts) : [payload];
   for (const p of parts) {
-    if (p.mimeType === "text/plain" && p.body?.data)
-      textPlain += Buffer.from(p.body.data, "base64").toString("utf8");
-    if (p.mimeType === "text/html" && p.body?.data)
-      textHtml += Buffer.from(p.body.data, "base64").toString("utf8");
+    if (p.mimeType === "text/plain" && p.body?.data) {
+      textPlain += Buffer.from(
+        p.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64"
+      ).toString("utf8");
+    }
+    if (p.mimeType === "text/html" && p.body?.data) {
+      textHtml += Buffer.from(
+        p.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64"
+      ).toString("utf8");
+    }
   }
   return { textPlain, textHtml };
 }
 
-async function saveAttachmentToGCS(userEmail, messageId, part, GCS_BUCKET) {
+// 例: doc202510032217370774652265.pdf → 2025-10-03 22:17:37
+function parseFaxAtFromFilename(filename) {
+  if (!filename) return null;
+  const m = filename.match(/^doc(\d{14})/); // YYYYMMDDHHmmss
+  if (!m) return null;
+  const s = m[1];
+  const y = Number(s.slice(0, 4));
+  const mo = Number(s.slice(4, 6));
+  const d = Number(s.slice(6, 8));
+  const h = Number(s.slice(8, 10));
+  const mi = Number(s.slice(10, 12));
+  const se = Number(s.slice(12, 14));
+  // JS Date: month is 0-based; ここではUTCで固める
+  return new Date(Date.UTC(y, mo - 1, d, h, mi, se));
+}
+
+// 件名や本文からFAX番号らしきものを抽出（暫定）
+function parseFaxNumberFromText(...texts) {
+  const joined = (texts || []).filter(Boolean).join(" ");
+  if (!joined) return null;
+  const candidates = joined.match(/\+?\d[\d\-\s()ー―‐－]{6,}\d/g);
+  if (!candidates) return null;
+  let best = candidates.sort((a, b) => b.length - a.length)[0];
+  best = best.replace(/[^\d+]/g, "");
+  if (best.replace(/^\+/, "").length < 7) return null;
+  return best;
+}
+
+// Gmail API から attachmentId を使って添付を取得して保存
+async function saveAttachmentToGCSViaAPI({
+  userEmail,
+  messageId,
+  part,
+  gmail,
+  GCS_BUCKET,
+}) {
   if (!bucket) return null;
   const attachId = part?.body?.attachmentId;
   if (!attachId) return null;
-  const b64 = (part.body.data || "")
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
+
+  const res = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachId,
+  });
+
+  const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
   const bytes = Buffer.from(b64, "base64");
   const filename = part.filename || `attachment-${attachId}`;
-  const objectPath = `gmail/${encodeURIComponent(
-    userEmail
-  )}/${messageId}/${filename}`;
+  const objectPath = `gmail/${encodeURIComponent(userEmail)}/${messageId}/${filename}`;
+
   await bucket.file(objectPath).save(bytes, {
     resumable: false,
     metadata: { contentType: part.mimeType || "application/octet-stream" },
   });
+
   return `gs://${GCS_BUCKET}/${objectPath}`;
 }
 
 // ==== FAX専用処理 ====
-export async function handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET) {
+export async function handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail) {
   const headers = payload?.headers || [];
   const subject = getHeader(headers, "Subject");
   const from = getHeader(headers, "From");
@@ -66,19 +114,28 @@ export async function handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET) {
 
   const { textPlain, textHtml } = extractBodies(payload);
 
+  // 添付保存 & FAX時刻の推定
   const attachments = [];
+  let faxAt = null;
   const parts = flattenParts(payload?.parts || []);
   for (const p of parts) {
     if (p?.filename && p.body?.attachmentId) {
-      const path = await saveAttachmentToGCS(
-        emailAddress,
-        m.data.id,
-        p,
-        GCS_BUCKET
-      );
+      if (!faxAt) {
+        const ts = parseFaxAtFromFilename(p.filename);
+        if (ts) faxAt = ts;
+      }
+      const path = await saveAttachmentToGCSViaAPI({
+        userEmail: emailAddress,
+        messageId: m.data.id,
+        part: p,
+        gmail,
+        GCS_BUCKET,
+      });
       if (path) attachments.push(path);
     }
   }
+
+  const faxNumber = parseFaxNumberFromText(subject, textPlain, textHtml);
 
   await db.collection("messages").doc(m.data.id).set(
     {
@@ -96,11 +153,13 @@ export async function handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET) {
       attachments,
       gcsBucket: GCS_BUCKET || null,
       createdAt: Date.now(),
+      faxAt: faxAt || null,
+      faxNumber: faxNumber || null,
     },
     { merge: true }
   );
 
   console.log(
-    `[FAX] saved message ${m.data.id} (attachments: ${attachments.length})`
+    `[FAX] saved message ${m.data.id} faxAt=${faxAt?.toISOString?.() || "null"} faxNumber=${faxNumber || "null"} (attachments: ${attachments.length})`
   );
 }
