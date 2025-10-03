@@ -8,6 +8,10 @@ import { google } from "googleapis";
 import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
 
+// ==== 外部処理 ====
+import { handleFaxMail } from "./faxHandler.js";
+import { handleNormalMail } from "./mailHandler.js";
+
 // ==== 環境変数 ====
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
 const GCS_BUCKET = process.env.GCS_BUCKET || "";
@@ -169,45 +173,14 @@ async function handleHistory(emailAddress, historyId) {
     const m = await gmail.users.messages.get({ userId: "me", id, format: "full" });
     const payload = m.data.payload;
     const headers = payload?.headers || [];
-    const subject = getHeader(headers, "Subject");
     const from = getHeader(headers, "From");
-    const to = getHeader(headers, "To");
-    const cc = getHeader(headers, "Cc");
-    const dateHdr = getHeader(headers, "Date");
-    const internalDateMs = m.data.internalDate ? Number(m.data.internalDate) : Date.parse(dateHdr);
-    const { textPlain, textHtml } = extractBodies(payload);
 
-    const attachments = [];
-    const parts = flattenParts(payload?.parts || []);
-    for (const p of parts) {
-      if (p?.filename && p.body?.attachmentId) {
-        const path = await saveAttachmentToGCS(emailAddress, id, p);
-        if (path) attachments.push(path);
-      }
+    // === 分岐: FAXメール or 通常メール ===
+    if (from.includes("akiyama.order@gmail.com")) {
+      await handleFaxMail(m, payload, emailAddress);
+    } else {
+      await handleNormalMail(m, payload, emailAddress);
     }
-
-    await db.collection("messages").doc(id).set(
-      {
-        user: emailAddress,
-        threadId: m.data.threadId,
-        internalDate: internalDateMs || null,
-        receivedAt: internalDateMs ? new Date(internalDateMs) : new Date(),
-        from,
-        to,
-        cc,
-        subject,
-        snippet: m.data.snippet || "",
-        textPlain,
-        textHtml,
-        labels: m.data.labelIds || [],
-        attachments,
-        gcsBucket: GCS_BUCKET || null,
-        createdAt: Date.now(),
-      },
-      { merge: true }
-    );
-
-    console.log(`Saved message ${id} (attachments: ${attachments.length})`);
   }
 
   await userDoc.set({ lastHistoryId: historyId, updatedAt: Date.now() }, { merge: true });
