@@ -133,11 +133,10 @@ async function handleHistory(emailAddress, historyId) {
     });
     const payload = m.data.payload;
     const headers = payload?.headers || [];
-    const from = (headers.find(
-      (x) => x.name?.toLowerCase() === "from"
-    )?.value || "");
+    const from =
+      headers.find((x) => x.name?.toLowerCase() === "from")?.value || "";
 
-    // === 分岐: FAXメール or 通常メール（gmail を渡す以外は最小変更） ===
+    // === 分岐: FAXメール or 通常メール ===
     if (from.includes("akiyama.order@gmail.com")) {
       await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
     } else {
@@ -156,7 +155,7 @@ async function handleHistory(emailAddress, historyId) {
 // ヘルスチェック
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// Gmail Push 受信
+// Gmail Push 受信（修正版）
 app.post("/gmail/push", async (req, res) => {
   try {
     const msg = req.body?.message;
@@ -167,11 +166,21 @@ app.post("/gmail/push", async (req, res) => {
     const { emailAddress, historyId } = JSON.parse(decoded);
     if (!emailAddress || !historyId) return res.status(204).send();
 
-    await handleHistory(emailAddress, historyId);
-    return res.status(200).send();
+    // ✅ すぐACKを返す
+    res.status(204).send();
+
+    // ✅ 実処理は非同期で実行（タイムアウト防止）
+    setImmediate(async () => {
+      try {
+        await handleHistory(emailAddress, historyId);
+      } catch (e) {
+        console.error("[deferred handleHistory] error:", e);
+      }
+    });
   } catch (e) {
     console.error("Push handler error:", e);
-    return res.status(500).send();
+    // ✅ エラーでも再送防止のためACKを返す
+    return res.status(204).send();
   }
 });
 
