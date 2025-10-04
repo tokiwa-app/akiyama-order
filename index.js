@@ -17,7 +17,9 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ||
   "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
-const GMAIL_TOPIC = "projects/tokiwa-cloud-auth-25c0c/topics/gmail-inbox";
+const GMAIL_TOPIC =
+  process.env.GMAIL_TOPIC ||
+  "projects/tokiwa-cloud-auth-25c0c/topics/gmail-inbox";
 
 // Cloud Tasks 用
 const CLOUD_RUN_BASE_URL = process.env.CLOUD_RUN_BASE_URL; // 例: https://akiyama-order-xxxx.a.run.app
@@ -34,7 +36,8 @@ export const db = new Firestore(
 export const storage = new Storage();
 export const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
 
-const tasks = new CloudTasksClient();
+// ★ CloudTasksClient の変数名を変更（tasks と衝突防止）
+const cloudTasks = new CloudTasksClient();
 
 // ==== OAuth リフレッシュトークン保存 ====
 let cachedRefreshToken = process.env.OAUTH_REFRESH_TOKEN || null;
@@ -46,6 +49,7 @@ async function getStoredRefreshToken() {
   if (tok) cachedRefreshToken = tok;
   return cachedRefreshToken;
 }
+
 async function storeRefreshToken(token) {
   cachedRefreshToken = token || cachedRefreshToken;
   if (!token) return;
@@ -135,10 +139,10 @@ async function handleHistory(emailAddress, historyId) {
   );
 
   const limit = pLimit(4); // 同時4件まで処理
-  const tasks = [];
+  const workerPromises = [];
 
   for (const id of newIds) {
-    tasks.push(
+    workerPromises.push(
       limit(async () => {
         const m = await gmail.users.messages.get({
           userId: "me",
@@ -153,13 +157,30 @@ async function handleHistory(emailAddress, historyId) {
         if (from.includes("akiyama.order@gmail.com")) {
           await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
         } else {
-          await handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
+          await handleNormalMail(
+            m,
+            payload,
+            emailAddress,
+            db,
+            GCS_BUCKET,
+            gmail
+          );
         }
       })
     );
   }
 
-  await Promise.allSettled(tasks);
+  await Promise.allSettled(workerPromises);
+
+  // lastHistoryId の逆行更新を防ぐ
+  const current = await userDoc.get();
+  const curId = current.exists ? current.data().lastHistoryId : null;
+  if (curId && BigInt(curId) > BigInt(historyId)) {
+    console.log(
+      `[SKIP] newer historyId already stored (${curId} > ${historyId})`
+    );
+    return;
+  }
 
   await userDoc.set(
     { lastHistoryId: historyId, updatedAt: Date.now() },
@@ -169,23 +190,23 @@ async function handleHistory(emailAddress, historyId) {
 
 // ==== Cloud Tasks enqueue ====
 async function enqueueHistoryJob(payload) {
-  const project = await tasks.getProjectId();
-  const parent = tasks.queuePath(project, TASKS_LOCATION, TASKS_QUEUE_ID);
+  const project = await cloudTasks.getProjectId();
+  const parent = cloudTasks.queuePath(project, TASKS_LOCATION, TASKS_QUEUE_ID);
   if (!CLOUD_RUN_BASE_URL)
     throw new Error("CLOUD_RUN_BASE_URL is not configured");
 
   const url = `${CLOUD_RUN_BASE_URL}/tasks/gmail-history`;
-  const body = Buffer.from(JSON.stringify(payload)).toString("base64");
   const serviceAccountEmail = `tasks-invoker@${project}.iam.gserviceaccount.com`;
 
-  await tasks.createTask({
+  // ★ base64 せず、生 JSON を送信
+  await cloudTasks.createTask({
     parent,
     task: {
       httpRequest: {
         httpMethod: "POST",
         url,
         headers: { "Content-Type": "application/json" },
-        body,
+        body: Buffer.from(JSON.stringify(payload)),
         oidcToken: { serviceAccountEmail },
       },
     },
@@ -206,10 +227,8 @@ app.post("/gmail/push", async (req, res) => {
     const { emailAddress, historyId } = JSON.parse(decoded);
     if (!emailAddress || !historyId) return res.status(204).send();
 
-    // ✅ すぐACKを返す（再送防止）
     res.status(204).send();
 
-    // ✅ Cloud Tasks で非同期処理を登録
     enqueueHistoryJob({ emailAddress, historyId }).catch((e) =>
       console.error("[enqueueHistoryJob] failed:", e)
     );
@@ -222,7 +241,14 @@ app.post("/gmail/push", async (req, res) => {
 // Cloud Tasks worker（実際の処理）
 app.post("/tasks/gmail-history", async (req, res) => {
   try {
-    const { emailAddress, historyId } = req.body || {};
+    let body = req.body;
+    // ★ 保険：古いタスクで文字列になっていてもパース
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {}
+    }
+    const { emailAddress, historyId } = body || {};
     if (!emailAddress || !historyId) return res.status(400).send("bad request");
 
     console.log(`🛠️ tasks/gmail-history start: ${emailAddress}`);
@@ -235,7 +261,7 @@ app.post("/tasks/gmail-history", async (req, res) => {
   }
 });
 
-// OAuth 関連と watch 更新（省略なし・同じ）
+// OAuth 関連
 app.get("/oauth2/start", async (_req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
