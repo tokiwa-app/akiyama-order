@@ -3,6 +3,8 @@ import express from "express";
 import { google } from "googleapis";
 import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
+import { CloudTasksClient } from "@google-cloud/tasks";
+import pLimit from "p-limit";
 
 import { handleFaxMail } from "./faxHandler.js";
 import { handleNormalMail } from "./mailHandler.js";
@@ -17,6 +19,11 @@ const OAUTH_REDIRECT_URI =
   "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
 const GMAIL_TOPIC = "projects/tokiwa-cloud-auth-25c0c/topics/gmail-inbox";
 
+// Cloud Tasks 用
+const CLOUD_RUN_BASE_URL = process.env.CLOUD_RUN_BASE_URL; // 例: https://akiyama-order-xxxx.a.run.app
+const TASKS_LOCATION = process.env.TASKS_LOCATION || "asia-northeast2";
+const TASKS_QUEUE_ID = "gmail-history";
+
 // ==== 初期化 ====
 const app = express();
 app.use(express.json());
@@ -26,6 +33,8 @@ export const db = new Firestore(
 );
 export const storage = new Storage();
 export const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
+
+const tasks = new CloudTasksClient();
 
 // ==== OAuth リフレッシュトークン保存 ====
 let cachedRefreshToken = process.env.OAUTH_REFRESH_TOKEN || null;
@@ -125,25 +134,32 @@ async function handleHistory(emailAddress, historyId) {
     `Found ${newIds.size} new messages since ${lastHistoryId} for ${emailAddress}`
   );
 
-  for (const id of newIds) {
-    const m = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-    const payload = m.data.payload;
-    const headers = payload?.headers || [];
-    const from = (headers.find(
-      (x) => x.name?.toLowerCase() === "from"
-    )?.value || "");
+  const limit = pLimit(4); // 同時4件まで処理
+  const tasks = [];
 
-    // === 分岐: FAXメール or 通常メール（gmail を渡す以外は最小変更） ===
-    if (from.includes("akiyama.order@gmail.com")) {
-      await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
-    } else {
-      await handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
-    }
+  for (const id of newIds) {
+    tasks.push(
+      limit(async () => {
+        const m = await gmail.users.messages.get({
+          userId: "me",
+          id,
+          format: "full",
+        });
+        const payload = m.data.payload;
+        const headers = payload?.headers || [];
+        const from =
+          headers.find((x) => x.name?.toLowerCase() === "from")?.value || "";
+
+        if (from.includes("akiyama.order@gmail.com")) {
+          await handleFaxMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
+        } else {
+          await handleNormalMail(m, payload, emailAddress, db, GCS_BUCKET, gmail);
+        }
+      })
+    );
   }
+
+  await Promise.allSettled(tasks);
 
   await userDoc.set(
     { lastHistoryId: historyId, updatedAt: Date.now() },
@@ -151,31 +167,75 @@ async function handleHistory(emailAddress, historyId) {
   );
 }
 
+// ==== Cloud Tasks enqueue ====
+async function enqueueHistoryJob(payload) {
+  const project = await tasks.getProjectId();
+  const parent = tasks.queuePath(project, TASKS_LOCATION, TASKS_QUEUE_ID);
+  if (!CLOUD_RUN_BASE_URL)
+    throw new Error("CLOUD_RUN_BASE_URL is not configured");
+
+  const url = `${CLOUD_RUN_BASE_URL}/tasks/gmail-history`;
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64");
+  const serviceAccountEmail = `tasks-invoker@${project}.iam.gserviceaccount.com`;
+
+  await tasks.createTask({
+    parent,
+    task: {
+      httpRequest: {
+        httpMethod: "POST",
+        url,
+        headers: { "Content-Type": "application/json" },
+        body,
+        oidcToken: { serviceAccountEmail },
+      },
+    },
+  });
+}
+
 // ==== ルーティング ====
 
 // ヘルスチェック
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// Gmail Push 受信
+// Gmail Push（Cloud Tasks に委譲）
 app.post("/gmail/push", async (req, res) => {
   try {
     const msg = req.body?.message;
     if (!msg?.data) return res.status(204).send();
     const decoded = Buffer.from(msg.data, "base64").toString("utf8");
-    console.log("📩 Gmail Push Notification:", decoded);
-
     const { emailAddress, historyId } = JSON.parse(decoded);
     if (!emailAddress || !historyId) return res.status(204).send();
 
-    await handleHistory(emailAddress, historyId);
-    return res.status(200).send();
+    // ✅ すぐACKを返す（再送防止）
+    res.status(204).send();
+
+    // ✅ Cloud Tasks で非同期処理を登録
+    enqueueHistoryJob({ emailAddress, historyId }).catch((e) =>
+      console.error("[enqueueHistoryJob] failed:", e)
+    );
   } catch (e) {
     console.error("Push handler error:", e);
+    return res.status(204).send();
+  }
+});
+
+// Cloud Tasks worker（実際の処理）
+app.post("/tasks/gmail-history", async (req, res) => {
+  try {
+    const { emailAddress, historyId } = req.body || {};
+    if (!emailAddress || !historyId) return res.status(400).send("bad request");
+
+    console.log(`🛠️ tasks/gmail-history start: ${emailAddress}`);
+    await handleHistory(emailAddress, historyId);
+    console.log(`✅ tasks/gmail-history done: ${emailAddress}`);
+    return res.status(204).send();
+  } catch (e) {
+    console.error("tasks/gmail-history error:", e);
     return res.status(500).send();
   }
 });
 
-// OAuth: 同意フロー開始
+// OAuth 関連と watch 更新（省略なし・同じ）
 app.get("/oauth2/start", async (_req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
@@ -197,7 +257,6 @@ app.get("/oauth2/start", async (_req, res) => {
   }
 });
 
-// OAuth: コールバック
 app.get("/oauth2/callback", async (req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
@@ -213,9 +272,7 @@ app.get("/oauth2/callback", async (req, res) => {
     const { tokens } = await oAuth2.getToken(code);
     oAuth2.setCredentials(tokens);
 
-    if (tokens.refresh_token) {
-      await storeRefreshToken(tokens.refresh_token);
-    }
+    if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
 
     const gmail = google.gmail({ version: "v1", auth: oAuth2 });
     const watchRes = await gmail.users.watch({
@@ -228,31 +285,24 @@ app.get("/oauth2/callback", async (req, res) => {
     });
 
     const profile = await gmail.users.getProfile({ userId: "me" });
-    await db
-      .collection("gmail_users")
-      .doc(profile.data.emailAddress)
-      .set(
-        {
-          lastHistoryId: watchRes.data.historyId || null,
-          watchExpiration: watchRes.data.expiration || null,
-          updatedAt: Date.now(),
-        },
-        { merge: true }
-      );
-
-    res.set("Content-Type", "text/plain");
-    res.send(
-      `OK\nstored_refresh_token=${
-        tokens.refresh_token ? "yes" : "no"
-      }\nwatch historyId=${watchRes.data.historyId || "(none)"}\n`
+    await db.collection("gmail_users").doc(profile.data.emailAddress).set(
+      {
+        lastHistoryId: watchRes.data.historyId || null,
+        watchExpiration: watchRes.data.expiration || null,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
     );
+
+    res
+      .status(200)
+      .send(`OK\nwatch historyId=${watchRes.data.historyId || "(none)"}\n`);
   } catch (e) {
     console.error("oauth2/callback error", e);
     res.status(500).send("oauth callback error");
   }
 });
 
-// watch 更新
 app.post("/gmail/watch/renew", async (_req, res) => {
   try {
     const gmail = await getGmail();
@@ -265,17 +315,14 @@ app.post("/gmail/watch/renew", async (_req, res) => {
         labelFilterAction: "include",
       },
     });
-    await db
-      .collection("gmail_users")
-      .doc(profile.data.emailAddress)
-      .set(
-        {
-          lastHistoryId: watchRes.data.historyId || null,
-          watchExpiration: watchRes.data.expiration || null,
-          updatedAt: Date.now(),
-        },
-        { merge: true }
-      );
+    await db.collection("gmail_users").doc(profile.data.emailAddress).set(
+      {
+        lastHistoryId: watchRes.data.historyId || null,
+        watchExpiration: watchRes.data.expiration || null,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
     res.status(200).send("renewed");
   } catch (e) {
     console.error("watch renew error", e);
