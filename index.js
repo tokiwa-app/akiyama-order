@@ -1,7 +1,4 @@
-attachments,
-      gcsBucket: GCS_BUCKET || null,
-      messageType,const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null; // ここに入れておけば OAuth フロー不要
-const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase(); // 例: "akiyama.order@gmal.com"// index.js (polling, simple & stable)
+// index.js (polling, simple & stable)
 // 単一アカウントの Gmail を定期ポーリングして Firestore / Cloud Storage に保存
 // 目的：シンプル & 安定（Pub/Sub Push 不使用、リトライ地獄なし）
 
@@ -20,6 +17,7 @@ const OAUTH_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ||
   "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
 const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null; // ここに入れておけば OAuth フロー不要
+const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase(); // 例: "akiyama.order@gmail.com"
 
 // ポーリングの時間幅（通常運用）
 const LOOKBACK_HOURS = Number(process.env.LOOKBACK_HOURS || 48); // 直近48時間
@@ -28,16 +26,23 @@ const LOOKBACK_HOURS = Number(process.env.LOOKBACK_HOURS || 48); // 直近48時�
 const app = express();
 app.use(express.json());
 
-const db = new Firestore(FIREBASE_PROJECT_ID ? { projectId: FIREBASE_PROJECT_ID } : {});
+const db = new Firestore(
+  FIREBASE_PROJECT_ID ? { projectId: FIREBASE_PROJECT_ID } : {}
+);
 const storage = new Storage();
 const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
 
 // ==== ユーティリティ ====
 function b64UrlDecode(data) {
-  return Buffer.from((data || "").replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+  return Buffer.from(
+    (data || "").replace(/-/g, "+").replace(/_/g, "/"),
+    "base64"
+  ).toString("utf8");
 }
 function getHeader(headers, name) {
-  const h = (headers || []).find(x => x.name?.toLowerCase() === name.toLowerCase());
+  const h = (headers || []).find(
+    (x) => x.name?.toLowerCase() === name.toLowerCase()
+  );
   return h?.value || "";
 }
 function flattenParts(parts) {
@@ -56,14 +61,16 @@ function extractBodies(payload) {
   if (!payload) return { textPlain, textHtml };
   const parts = payload.parts ? flattenParts(payload.parts) : [payload];
   for (const p of parts) {
-    if (p.mimeType === "text/plain" && p.body?.data) textPlain += b64UrlDecode(p.body.data);
-    if (p.mimeType === "text/html" && p.body?.data) textHtml += b64UrlDecode(p.body.data);
+    if (p.mimeType === "text/plain" && p.body?.data)
+      textPlain += b64UrlDecode(p.body.data);
+    if (p.mimeType === "text/html" && p.body?.data)
+      textHtml += b64UrlDecode(p.body.data);
   }
   return { textPlain, textHtml };
 }
 function safeFilename(name) {
   const base = path.posix.basename(name || "attachment");
-  return encodeURIComponent(base.replace(/[-/\]/g, "_"));
+  return encodeURIComponent(base.replace(/[\u0000-\u001F\u007F/\\]/g, "_"));
 }
 
 // ==== OAuth リフレッシュトークン保存（任意：Firestore 保管） ====
@@ -78,23 +85,29 @@ async function getStoredRefreshToken() {
 async function storeRefreshToken(token) {
   cachedRefreshToken = token || cachedRefreshToken;
   if (!token) return;
-  await db.collection("system").doc("gmail_oauth").set(
-    { refresh_token: token, updatedAt: Date.now() },
-    { merge: true }
-  );
+  await db
+    .collection("system")
+    .doc("gmail_oauth")
+    .set({ refresh_token: token, updatedAt: Date.now() }, { merge: true });
 }
 
 // ==== Gmail クライアント ====
 async function getGmail() {
   const refresh = await getStoredRefreshToken();
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && refresh) {
-    const oAuth2 = new google.auth.OAuth2(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_REDIRECT_URI);
+    const oAuth2 = new google.auth.OAuth2(
+      OAUTH_CLIENT_ID,
+      OAUTH_CLIENT_SECRET,
+      OAUTH_REDIRECT_URI
+    );
     oAuth2.setCredentials({ refresh_token: refresh });
     return google.gmail({ version: "v1", auth: oAuth2 });
   }
   // サービスアカウントでの Gmail 直接アクセスは通常不可（DWD 等が必要）。
   // 必ずリフレッシュトークンを用意してください。
-  throw new Error("No OAuth refresh token available. Use /oauth2/start to link Gmail or set OAUTH_REFRESH_TOKEN.");
+  throw new Error(
+    "No OAuth refresh token available. Use /oauth2/start to link Gmail or set OAUTH_REFRESH_TOKEN."
+  );
 }
 
 // ==== 添付保存 ====
@@ -103,11 +116,17 @@ async function saveAttachmentToGCS(userEmail, messageId, part) {
   const attachId = part?.body?.attachmentId;
   if (!attachId) return null;
   const gmail = await getGmail();
-  const res = await gmail.users.messages.attachments.get({ userId: "me", messageId, id: attachId });
+  const res = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachId,
+  });
   const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
   const bytes = Buffer.from(b64, "base64");
   const filename = safeFilename(part.filename || `attachment-${attachId}`);
-  const objectPath = `gmail/${encodeURIComponent(userEmail)}/${messageId}/${filename}`;
+  const objectPath = `gmail/${encodeURIComponent(
+    userEmail
+  )}/${messageId}/${filename}`;
   await bucket.file(objectPath).save(bytes, {
     resumable: false,
     metadata: { contentType: part.mimeType || "application/octet-stream" },
@@ -124,13 +143,18 @@ async function saveMessageDoc(emailAddress, m) {
   const to = getHeader(headers, "To");
   const cc = getHeader(headers, "Cc");
   const dateHdr = getHeader(headers, "Date");
-  const internalDateMs = m.data.internalDate ? Number(m.data.internalDate) : Date.parse(dateHdr);
+  const internalDateMs = m.data.internalDate
+    ? Number(m.data.internalDate)
+    : Date.parse(dateHdr);
   const { textPlain, textHtml } = extractBodies(payload);
 
   // From ヘッダからメールアドレスを抽出して小文字化
   const addrMatch = (from || "").match(/<([^>]+)>/);
-  const fromEmail = (addrMatch ? addrMatch[1] : (from || "")).trim().toLowerCase();
-  const messageType = FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
+  const fromEmail = (addrMatch ? addrMatch[1] : (from || ""))
+    .trim()
+    .toLowerCase();
+  const messageType =
+    FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
 
   const attachments = [];
   const parts = flattenParts(payload?.parts || []);
@@ -141,27 +165,31 @@ async function saveMessageDoc(emailAddress, m) {
     }
   }
 
-  await db.collection("messages").doc(m.data.id).set(
-    {
-      user: emailAddress,
-      threadId: m.data.threadId,
-      internalDate: internalDateMs || null,
-      receivedAt: internalDateMs ? new Date(internalDateMs) : new Date(),
-      from,
-      to,
-      cc,
-      subject,
-      snippet: m.data.snippet || "",
-      textPlain,
-      textHtml,
-      labels: m.data.labelIds || [],
-      attachments,
-      gcsBucket: GCS_BUCKET || null,
-      updatedAt: Date.now(),
-      createdAt: Date.now(), // 既存でも merge なので安全
-    },
-    { merge: true }
-  );
+  await db
+    .collection("messages")
+    .doc(m.data.id)
+    .set(
+      {
+        user: emailAddress,
+        threadId: m.data.threadId,
+        internalDate: internalDateMs || null,
+        receivedAt: internalDateMs ? new Date(internalDateMs) : new Date(),
+        from,
+        to,
+        cc,
+        subject,
+        snippet: m.data.snippet || "",
+        textPlain,
+        textHtml,
+        labels: m.data.labelIds || [],
+        attachments,
+        gcsBucket: GCS_BUCKET || null,
+        messageType,
+        updatedAt: Date.now(),
+        createdAt: Date.now(), // 既存でも merge なので安全
+      },
+      { merge: true }
+    );
 }
 
 // ==== ルーティング ====
@@ -170,9 +198,18 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 // OAuth: 初回リンク用（単一ユーザー想定）
 app.get("/oauth2/start", async (_req, res) => {
   try {
-    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) return res.status(400).send("OAuth client not set");
-    const oAuth2 = new google.auth.OAuth2(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_REDIRECT_URI);
-    const url = oAuth2.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: ["https://www.googleapis.com/auth/gmail.readonly"] });
+    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
+      return res.status(400).send("OAuth client not set");
+    const oAuth2 = new google.auth.OAuth2(
+      OAUTH_CLIENT_ID,
+      OAUTH_CLIENT_SECRET,
+      OAUTH_REDIRECT_URI
+    );
+    const url = oAuth2.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
     res.redirect(url);
   } catch (e) {
     console.error("oauth2/start error", e);
@@ -181,10 +218,15 @@ app.get("/oauth2/start", async (_req, res) => {
 });
 app.get("/oauth2/callback", async (req, res) => {
   try {
-    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) return res.status(400).send("OAuth client not set");
+    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
+      return res.status(400).send("OAuth client not set");
     const code = req.query?.code;
     if (!code) return res.status(400).send("missing code");
-    const oAuth2 = new google.auth.OAuth2(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_REDIRECT_URI);
+    const oAuth2 = new google.auth.OAuth2(
+      OAUTH_CLIENT_ID,
+      OAUTH_CLIENT_SECRET,
+      OAUTH_REDIRECT_URI
+    );
     const { tokens } = await oAuth2.getToken(code);
     if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
     res.status(200).send("linked");
@@ -204,7 +246,10 @@ app.post("/gmail/poll", async (req, res) => {
 
     // 環境変数 LOOKBACK_HOURS or クエリ ?hours=..
     const hoursParam = Number(req.query?.hours || LOOKBACK_HOURS);
-    const hours = Number.isFinite(hoursParam) && hoursParam > 0 ? Math.floor(hoursParam) : LOOKBACK_HOURS;
+    const hours =
+      Number.isFinite(hoursParam) && hoursParam > 0
+        ? Math.floor(hoursParam)
+        : LOOKBACK_HOURS;
     const q = `newer_than:${hours}h in:inbox`;
 
     let pageToken;
@@ -212,27 +257,39 @@ app.post("/gmail/poll", async (req, res) => {
     let seen = 0;
 
     do {
-      const list = await gmail.users.messages.list({ userId: "me", q, pageToken, maxResults: 200 });
+      const list = await gmail.users.messages.list({
+        userId: "me",
+        q,
+        pageToken,
+        maxResults: 200,
+      });
       pageToken = list.data.nextPageToken || null;
-      const ids = (list.data.messages || []).map(m => m.id);
+      const ids = (list.data.messages || []).map((m) => m.id);
       if (!ids.length) break;
 
-      // 既存スキップのため Firestore を先に確認
+      // 既存スキップ（冪等）
       for (const id of ids) {
         seen++;
         const doc = await db.collection("messages").doc(id).get();
-        if (doc.exists) continue; // 既存ならスキップ（冪等）
-        const full = await gmail.users.messages.get({ userId: "me", id, format: "full" });
+        if (doc.exists) continue; // 既存ならスキップ
+        const full = await gmail.users.messages.get({
+          userId: "me",
+          id,
+          format: "full",
+        });
         await saveMessageDoc(emailAddress, full);
         newCount++;
       }
     } while (pageToken);
 
     const ms = Date.now() - started;
-    res.status(200).send(`OK processed=${seen} new=${newCount} hours=${hours} in ${ms}ms`);
+    res
+      .status(200)
+      .send(`OK processed=${seen} new=${newCount} hours=${hours} in ${ms}ms`);
   } catch (e) {
     console.error("/gmail/poll error:", e);
-    // Push ではないので 500 を返しても雪だるまにはならないが、次サイクルで回復するため 200 にしてもよい
+    // Push ではないので 500 を返しても雪だるまにはならないが、
+    // 次サイクルで回復するため 200 にしてもよい
     res.status(200).send("OK (partial or error logged)");
   }
 });
