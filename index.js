@@ -1,4 +1,7 @@
-// index.js (polling, simple & stable)
+attachments,
+      gcsBucket: GCS_BUCKET || null,
+      messageType,const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null; // ここに入れておけば OAuth フロー不要
+const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase(); // 例: "akiyama.order@gmal.com"// index.js (polling, simple & stable)
 // 単一アカウントの Gmail を定期ポーリングして Firestore / Cloud Storage に保存
 // 目的：シンプル & 安定（Pub/Sub Push 不使用、リトライ地獄なし）
 
@@ -123,6 +126,11 @@ async function saveMessageDoc(emailAddress, m) {
   const dateHdr = getHeader(headers, "Date");
   const internalDateMs = m.data.internalDate ? Number(m.data.internalDate) : Date.parse(dateHdr);
   const { textPlain, textHtml } = extractBodies(payload);
+
+  // From ヘッダからメールアドレスを抽出して小文字化
+  const addrMatch = (from || "").match(/<([^>]+)>/);
+  const fromEmail = (addrMatch ? addrMatch[1] : (from || "")).trim().toLowerCase();
+  const messageType = FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
 
   const attachments = [];
   const parts = flattenParts(payload?.parts || []);
