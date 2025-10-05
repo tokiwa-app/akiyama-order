@@ -19,8 +19,8 @@ const OAUTH_REDIRECT_URI =
 const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null; // ここに入れておけば OAuth フロー不要
 const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase(); // 例: "akiyama.order@gmail.com"
 
-// ポーリングの時間幅（通常運用）
-const LOOKBACK_HOURS = Number(process.env.LOOKBACK_HOURS || 48); // 直近48時間
+// ポーリングの時間幅（通常運用：直近10分のみ対象）
+const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
 
 // ==== 初期化 ====
 const app = express();
@@ -236,7 +236,7 @@ app.get("/oauth2/callback", async (req, res) => {
   }
 });
 
-// ポーリング実行（Cloud Scheduler が毎分叩く）
+// ポーリング実行（Cloud Scheduler が2分おき等で叩く）
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
   try {
@@ -244,13 +244,16 @@ app.post("/gmail/poll", async (req, res) => {
     const profile = await gmail.users.getProfile({ userId: "me" });
     const emailAddress = profile.data.emailAddress || "me";
 
-    // 環境変数 LOOKBACK_HOURS or クエリ ?hours=..
-    const hoursParam = Number(req.query?.hours || LOOKBACK_HOURS);
-    const hours =
-      Number.isFinite(hoursParam) && hoursParam > 0
-        ? Math.floor(hoursParam)
-        : LOOKBACK_HOURS;
-    const q = `newer_than:${hours}h in:inbox`;
+    // 環境変数 LOOKBACK_MINUTES or クエリ ?minutes=..
+    const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
+    const minutes =
+      Number.isFinite(minutesParam) && minutesParam > 0
+        ? Math.floor(minutesParam)
+        : LOOKBACK_MINUTES;
+
+    // 直近 N 分のみを Gmail 検索（epoch秒を使うと分単位で正確）
+    const cutoffEpoch = Math.floor((Date.now() - minutes * 60 * 1000) / 1000);
+    const q = `after:${cutoffEpoch} in:inbox`;
 
     let pageToken;
     let newCount = 0;
@@ -285,7 +288,9 @@ app.post("/gmail/poll", async (req, res) => {
     const ms = Date.now() - started;
     res
       .status(200)
-      .send(`OK processed=${seen} new=${newCount} hours=${hours} in ${ms}ms`);
+      .send(
+        `OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`
+      );
   } catch (e) {
     console.error("/gmail/poll error:", e);
     // Push ではないので 500 を返しても雪だるまにはならないが、
