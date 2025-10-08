@@ -13,20 +13,30 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
     const data = msgSnap.data();
     const attachments = data.attachments || [];
+    
+    // --- 0. OCR処理を実行し、結果（全文・上部・図面有無）を抽出 ---
+    const { fullOcrText, topOcrText, hasDrawing } = await runOcrAndDetectDrawing(
+      bucket,
+      attachments
+    );
+
+    // テキストプールにOCR結果を追加して、管理番号と顧客特定の精度を向上
     const textPool = [
       data.subject || "",
       data.textPlain || "",
       data.textHtml || "",
+      fullOcrText, // QRコードや添付画像内のテキストも対象とする
     ].join(" ");
 
     // --- 1. 管理番号抽出または生成 ---
+    // QRコードの内容 (aksNo) もここで認識されることを期待
     const existing = extractManagementNo(textPool);
     const managementNo = await ensureManagementNo(firestore, existing);
 
-    // --- 2. OCRから図面有無を確認 ---
-    const hasDrawing = await detectDrawingFromAttachments(bucket, attachments);
+    // --- 2. OCRから図面有無を確認 --- (runOcrAndDetectDrawingで処理済み)
 
     // --- 3. 顧客特定 ---
+    // 顧客特定にもOCRテキストの上部（ファックス上部など）も含める
     const customer = await detectCustomer(firestore, textPool);
 
     // --- 4. 工程Todo設定 ---
@@ -40,6 +50,10 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         customerId: customer?.id || null,
         customerName: customer?.name || null,
         ...process,
+        ocr: {
+          fullText: fullOcrText, // OCRで読み取った全てのテキストを保存
+          topText: topOcrText,   // OCRで読み取った上部10行のテキストを保存
+        },
         processedAt: Date.now(),
       },
       { merge: true }
@@ -55,6 +69,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
 /** ========== 管理番号関連 ========== **/
 export function extractManagementNo(text = "") {
+  // 管理No、管理番号、aksNo のいずれかを探し、それに続く3〜10文字の英数字を抽出
   const re = /(?:管理\s*No|管理番号|aksNo)\s*[:：]?\s*([A-Za-z0-9]{3,10})/i;
   const m = text.match(re);
   return m ? m[1].toUpperCase() : null;
@@ -92,21 +107,36 @@ export async function ensureManagementNo(firestore, extracted) {
   });
 }
 
-/** ========== OCR / 図面検出 ========== **/
-async function detectDrawingFromAttachments(bucket, attachments) {
-  if (!attachments?.length) return false;
+/** ========== OCR / 図面検出 (新) ========== **/
+async function runOcrAndDetectDrawing(bucket, attachments) {
+  let fullOcrText = "";
+  let topOcrText = "";
+  let hasDrawing = false;
+  if (!attachments?.length) return { fullOcrText, topOcrText, hasDrawing };
 
   for (const gcsPath of attachments) {
     if (!gcsPath.startsWith("gs://")) continue;
     try {
+      // Vision APIでテキスト検出を実行
       const [result] = await client.textDetection(gcsPath);
       const text = result.fullTextAnnotation?.text || "";
-      if (isDrawingLayout(text)) return true;
+      if (!text) continue;
+
+      fullOcrText += text + " "; // スペース区切りでテキストを結合
+
+      // 上部1cm相当のテキスト (10行目まで) を抽出
+      const top = text.split("\n").slice(0, 10).join(" ");
+      topOcrText += top + " ";
+
+      // 図面判定 (上部テキストのみを使用)
+      if (isDrawingLayout(top)) {
+        hasDrawing = true; // 1つでも図面と判定されたら true
+      }
     } catch (e) {
       console.warn("OCR failed:", e.message);
     }
   }
-  return false;
+  return { fullOcrText: fullOcrText.trim(), topOcrText: topOcrText.trim(), hasDrawing };
 }
 
 function isDrawingLayout(text) {
@@ -125,13 +155,16 @@ async function detectCustomer(firestore, textPool) {
     if (!snap.exists) return null;
 
     const arr = Object.values(snap.data() || {});
-    const text = textPool.replace(/\s+/g, "").toLowerCase();
+    // 検索効率を上げるため、スペースを除去して小文字化
+    const text = textPool.replace(/\s+/g, "").toLowerCase(); 
 
     for (const c of arr) {
       const name = (c.name || "").replace(/\s+/g, "").toLowerCase();
       const kana = (c.kana || "").toLowerCase();
       const short = (c.shortName || "").toLowerCase();
       const aliases = (c.aliases || []).map((a) => a.toLowerCase());
+      
+      // 顧客名、フリガナ、略称、エイリアスのいずれかがテキストに含まれているかチェック
       if (
         text.includes(name) ||
         text.includes(kana) ||
