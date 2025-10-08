@@ -39,11 +39,22 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     ].join(" ");
 
     // === 1) 管理番号（既存抽出 or 自動採番） ===
+    // 管理番号抽出には、すべての情報を含む textPool を使用
     const existing = extractManagementNo(textPool);
     const managementNo = await ensureManagementNo(firestore, existing);
 
-    // === 2) 顧客特定（OCR＋本文で照合） ===
-    const customer = await detectCustomer(firestore, textPool);
+    // === 2) 顧客特定（★ 修正箇所：1行目最優先 → 全文フォールバック） ===
+    let customer = null;
+
+    // A. 第1段階: OCRの1行目（最も信頼できる情報）のみで検索
+    if (topOcrText) {
+      customer = await detectCustomer(firestore, topOcrText);
+    }
+    
+    // B. 第2段階: 1行目でヒットしなかった場合のみ、全文で検索
+    if (!customer) {
+      customer = await detectCustomer(firestore, textPool);
+    }
 
     // === 3) 工程TODO（図面有無） ===
     const process = detectProcessTodo(hasDrawing);
@@ -182,7 +193,7 @@ async function runOcrAndDetectDrawing(attachments) {
 
     fullOcrText += (fullOcrText ? "\n" : "") + text;
     
-    // ★★★ 修正箇所：最初の1行目のみを取得するよう変更
+    // ★★★ topTextの抽出ロジック：最初の1行目のみに変更
     const top = text.split("\n")[0] || ""; 
     
     topOcrText += (topOcrText ? " " : "") + top;
@@ -206,8 +217,8 @@ function isDrawingByHeuristics(text) {
   return score >= 2; // 2点以上で「図面あり」
 }
 
-/** ================ 顧客マスタ照合 ================= */
-async function detectCustomer(firestore, textPool) {
+/** ================ 顧客マスタ照合（★ 修正済み） ================= */
+async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
       .collection("system_configs")
@@ -216,22 +227,27 @@ async function detectCustomer(firestore, textPool) {
     if (!snap.exists) return null;
 
     const arr = Object.values(snap.data() || {});
-    const text = (textPool || "").replace(/\s+/g, "").toLowerCase();
+    
+    // 検索ソース（topOcrText または textPool）の準備: すべての空白を削除し小文字化（OCRノイズ対応）
+    const searchSource = (sourceText || "").replace(/\s+/g, "").toLowerCase();
 
     for (const c of arr) {
-      const name = (c.name || "").replace(/\s+/g, "").toLowerCase();
-      const kana = (c.kana || "").toLowerCase();
-      const short = (c.shortName || "").toLowerCase();
+      // マスタ側のエイリアスを取得
       const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
-
+      
+      // ★ 簡略化された照合ロジック: aliases のみが検索対象
       if (
-        (name && text.includes(name)) ||
-        (kana && text.includes(kana)) ||
-        (short && text.includes(short)) ||
-        (aliases.length && aliases.some((a) => a && text.includes(a)))
+        aliases.length &&
+        aliases.some((a) => {
+          // エイリアス側も、検索ソースと同様に空白を削除し、完全に一致するか '含む' でチェック
+          const cleanedAlias = (a || "").replace(/\s+/g, "").toLowerCase();
+          return cleanedAlias && searchSource.includes(cleanedAlias);
+        })
       ) {
         return { id: c.id, name: c.name };
       }
+      
+      // name, kana, shortName のチェックは削除されました
     }
   } catch (e) {
     console.error("detectCustomer error:", e);
