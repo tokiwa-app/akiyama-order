@@ -181,7 +181,10 @@ async function runOcrAndDetectDrawing(attachments) {
     if (!text) continue;
 
     fullOcrText += (fullOcrText ? "\n" : "") + text;
-    const top = text.split("\n").slice(0, 40).join(" ");
+    
+    // ★★★ 修正箇所：最初の1行目のみを取得するよう変更
+    const top = text.split("\n")[0] || ""; 
+    
     topOcrText += (topOcrText ? " " : "") + top;
 
     if (isDrawingByHeuristics(text)) hasDrawing = true;
