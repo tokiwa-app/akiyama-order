@@ -1,31 +1,26 @@
-// index.js (polling, simple & stable)
-// 単一アカウントの Gmail を定期ポーリングして Firestore / Cloud Storage に保存
-// 目的：シンプル & 安定（Pub/Sub Push 不使用、リトライ地獄なし）
-
+// index.js
 import express from "express";
 import { google } from "googleapis";
 import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
 import path from "path";
+import { runAfterProcess } from "./afterProcess.js"; // ← 追加
 
 // ==== 環境変数 ====
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
-const GCS_BUCKET = process.env.GCS_BUCKET || ""; // 添付保存先（必須推奨）
-const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || ""; // OAuth 発行用（初回のみ）
+const GCS_BUCKET = process.env.GCS_BUCKET || "";
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ||
   "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
-const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null; // ここに入れておけば OAuth フロー不要
-const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase(); // 例: "akiyama.order@gmail.com"
-
-// ポーリングの時間幅（通常運用：直近10分のみ対象）
+const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null;
+const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase();
 const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
 
 // ==== 初期化 ====
 const app = express();
 app.use(express.json());
-
 const db = new Firestore(
   FIREBASE_PROJECT_ID ? { projectId: FIREBASE_PROJECT_ID } : {}
 );
@@ -73,7 +68,7 @@ function safeFilename(name) {
   return encodeURIComponent(base.replace(/[\u0000-\u001F\u007F/\\]/g, "_"));
 }
 
-// ==== OAuth リフレッシュトークン保存（任意：Firestore 保管） ====
+// ==== OAuth 関連 ====
 let cachedRefreshToken = OAUTH_REFRESH_TOKEN;
 async function getStoredRefreshToken() {
   if (cachedRefreshToken) return cachedRefreshToken;
@@ -91,7 +86,6 @@ async function storeRefreshToken(token) {
     .set({ refresh_token: token, updatedAt: Date.now() }, { merge: true });
 }
 
-// ==== Gmail クライアント ====
 async function getGmail() {
   const refresh = await getStoredRefreshToken();
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && refresh) {
@@ -103,11 +97,7 @@ async function getGmail() {
     oAuth2.setCredentials({ refresh_token: refresh });
     return google.gmail({ version: "v1", auth: oAuth2 });
   }
-  // サービスアカウントでの Gmail 直接アクセスは通常不可（DWD 等が必要）。
-  // 必ずリフレッシュトークンを用意してください。
-  throw new Error(
-    "No OAuth refresh token available. Use /oauth2/start to link Gmail or set OAUTH_REFRESH_TOKEN."
-  );
+  throw new Error("No OAuth refresh token available.");
 }
 
 // ==== 添付保存 ====
@@ -148,7 +138,6 @@ async function saveMessageDoc(emailAddress, m) {
     : Date.parse(dateHdr);
   const { textPlain, textHtml } = extractBodies(payload);
 
-  // From ヘッダからメールアドレスを抽出して小文字化
   const addrMatch = (from || "").match(/<([^>]+)>/);
   const fromEmail = (addrMatch ? addrMatch[1] : (from || ""))
     .trim()
@@ -186,16 +175,18 @@ async function saveMessageDoc(emailAddress, m) {
         gcsBucket: GCS_BUCKET || null,
         messageType,
         updatedAt: Date.now(),
-        createdAt: Date.now(), // 既存でも merge なので安全
+        createdAt: Date.now(),
       },
       { merge: true }
     );
+
+  // ✅ ここで後処理呼び出し
+  await runAfterProcess({ messageId: m.data.id, firestore: db, bucket });
 }
 
 // ==== ルーティング ====
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// OAuth: 初回リンク用（単一ユーザー想定）
 app.get("/oauth2/start", async (_req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
@@ -212,10 +203,10 @@ app.get("/oauth2/start", async (_req, res) => {
     });
     res.redirect(url);
   } catch (e) {
-    console.error("oauth2/start error", e);
     res.status(500).send("oauth start error");
   }
 });
+
 app.get("/oauth2/callback", async (req, res) => {
   try {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
@@ -231,27 +222,22 @@ app.get("/oauth2/callback", async (req, res) => {
     if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
     res.status(200).send("linked");
   } catch (e) {
-    console.error("oauth2/callback error", e);
     res.status(500).send("oauth callback error");
   }
 });
 
-// ポーリング実行（Cloud Scheduler が2分おき等で叩く）
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
   try {
     const gmail = await getGmail();
     const profile = await gmail.users.getProfile({ userId: "me" });
     const emailAddress = profile.data.emailAddress || "me";
-
-    // 環境変数 LOOKBACK_MINUTES or クエリ ?minutes=..
     const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
     const minutes =
       Number.isFinite(minutesParam) && minutesParam > 0
         ? Math.floor(minutesParam)
         : LOOKBACK_MINUTES;
 
-    // 直近 N 分のみを Gmail 検索（epoch秒を使うと分単位で正確）
     const cutoffEpoch = Math.floor((Date.now() - minutes * 60 * 1000) / 1000);
     const q = `after:${cutoffEpoch} in:inbox`;
 
@@ -270,11 +256,10 @@ app.post("/gmail/poll", async (req, res) => {
       const ids = (list.data.messages || []).map((m) => m.id);
       if (!ids.length) break;
 
-      // 既存スキップ（冪等）
       for (const id of ids) {
         seen++;
         const doc = await db.collection("messages").doc(id).get();
-        if (doc.exists) continue; // 既存ならスキップ
+        if (doc.exists) continue;
         const full = await gmail.users.messages.get({
           userId: "me",
           id,
@@ -288,13 +273,9 @@ app.post("/gmail/poll", async (req, res) => {
     const ms = Date.now() - started;
     res
       .status(200)
-      .send(
-        `OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`
-      );
+      .send(`OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`);
   } catch (e) {
     console.error("/gmail/poll error:", e);
-    // Push ではないので 500 を返しても雪だるまにはならないが、
-    // 次サイクルで回復するため 200 にしてもよい
     res.status(200).send("OK (partial or error logged)");
   }
 });
