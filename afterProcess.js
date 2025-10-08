@@ -1,4 +1,3 @@
-// afterProcess.js
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 
@@ -6,7 +5,9 @@ import { Storage } from "@google-cloud/storage";
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
 
-/** ================= MAIN ENTRY ================= */
+/** ================= MAIN ENTRY =================
+ * index.js の saveMessageDoc() 直後に呼ばれる想定
+ */
 export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
     const msgRef = firestore.collection("messages").doc(messageId);
@@ -17,12 +18,10 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
 
     // === 0) OCR（PDF/TIFF/画像に対応） ===
-    // 添付の1枚目だけOCR対象
     const { fullOcrText, topOcrText, hasDrawing } = await runOcrAndDetectDrawing(
-      attachments.slice(0, 1)
+      attachments
     );
 
-    // メール本文＋OCR全文をまとめた検索ソース
     const textPool = [
       data.subject || "",
       data.textPlain || "",
@@ -30,14 +29,21 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       fullOcrText || "",
     ].join(" ");
 
-    // === 1) 管理番号 ===
+    // === 1) 管理番号（既存抽出 or 自動採番） ===
     const existing = extractManagementNo(textPool);
     const managementNo = await ensureManagementNo(firestore, existing);
 
-    // === 2) 顧客特定（全文のみ） ===
-    const customer = await detectCustomer(firestore, textPool);
+    // === 2) 顧客特定（修正版） ===
+    let customer = null;
 
-    // === 3) 工程TODO ===
+    if (topOcrText) {
+      customer = await detectCustomer(firestore, topOcrText);
+    }
+    if (!customer) {
+      customer = await detectCustomer(firestore, textPool);
+    }
+
+    // === 3) 工程TODO（図面有無） ===
     const process = detectProcessTodo(hasDrawing);
 
     // === 4) Firestore 反映 ===
@@ -75,7 +81,9 @@ export function extractManagementNo(text = "") {
 export async function ensureManagementNo(firestore, extracted) {
   if (extracted) return extracted;
 
-  const seqRef = firestore.collection("system_configs").doc("sequence_managementNo_global");
+  const seqRef = firestore
+    .collection("system_configs")
+    .doc("sequence_managementNo_global");
 
   return await firestore.runTransaction(async (tx) => {
     const snap = await tx.get(seqRef);
@@ -91,13 +99,17 @@ export async function ensureManagementNo(firestore, extracted) {
       newDigits = digits + 1;
     }
 
-    tx.set(seqRef, { v: next, digits: newDigits, updatedAt: Date.now() }, { merge: true });
+    tx.set(
+      seqRef,
+      { v: next, digits: newDigits, updatedAt: Date.now() },
+      { merge: true }
+    );
 
     return next.toString(16).toUpperCase().padStart(newDigits, "0");
   });
 }
 
-/** ================ OCRユーティリティ（PDF/TIFF/画像） ================= */
+/** ================ OCRユーティリティ ================= */
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
@@ -136,31 +148,31 @@ async function ocrImageText(gcsUri) {
   return res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || "";
 }
 
-// 添付（1枚目のみ）OCR実行
 async function runOcrAndDetectDrawing(attachments) {
   let fullOcrText = "";
   let topOcrText = "";
   let hasDrawing = false;
 
-  if (!attachments?.length) return { fullOcrText, topOcrText, hasDrawing };
-  const uri = attachments[0];
-  if (!uri?.startsWith("gs://")) return { fullOcrText, topOcrText, hasDrawing };
+  for (const uri of attachments || []) {
+    if (!uri?.startsWith("gs://")) continue;
 
-  const lower = uri.toLowerCase();
-  let text = "";
-  try {
-    if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
-      text = await ocrPdfFirstPageText(uri);
-    } else {
-      text = await ocrImageText(uri);
+    const lower = uri.toLowerCase();
+    let text = "";
+    try {
+      if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
+        text = await ocrPdfFirstPageText(uri);
+      } else {
+        text = await ocrImageText(uri);
+      }
+    } catch (e) {
+      console.warn("OCR failed:", uri, e?.message || e);
+      continue;
     }
-  } catch (e) {
-    console.warn("OCR failed:", uri, e?.message || e);
-  }
+    if (!text) continue;
 
-  if (text) {
-    fullOcrText = text;
-    topOcrText = text.split("\n")[0] || "";
+    fullOcrText += (fullOcrText ? "\n" : "") + text;
+    const top = text.split("\n")[0] || "";
+    topOcrText += (topOcrText ? " " : "") + top;
     if (isDrawingByHeuristics(text)) hasDrawing = true;
   }
 
@@ -180,32 +192,53 @@ function isDrawingByHeuristics(text) {
   return score >= 2;
 }
 
-/** ================ 顧客マスタ照合（全文のみ・最初にヒットしたものを採用） ================= */
-async function detectCustomer(firestore, sourceText = "") {
+/** ================ 顧客マスタ照合（修正版） ================= */
+async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
       .collection("system_configs")
       .doc("system_customers_master")
       .get();
-    if (!snap.exists) return null;
+    if (!snap.exists) {
+      console.warn("⚠ system_customers_master not found");
+      return null;
+    }
 
-    const customers = Object.values(snap.data() || {});
-    const text = String(sourceText);
+    const data = snap.data() || {};
+    let arr = [];
+    if (Array.isArray(data)) {
+      arr = data;
+    } else if (data.customers && typeof data.customers === "object") {
+      arr = Object.values(data.customers);
+    } else {
+      arr = Object.values(data);
+    }
+    arr = arr.filter((x) => x && typeof x === "object");
 
-    for (const c of customers) {
-      const aliases = Array.isArray(c?.aliases) ? c.aliases : [];
-      const cleaned = aliases
-        .map(a => (a ?? "").trim())
-        .filter(a => a.length > 0);
-      if (cleaned.length === 0) continue;
+    const raw = String(sourceText || "").toLowerCase();
+    const compact = raw.replace(/\s+/g, "");
 
-      for (const alias of cleaned) {
-        if (text.includes(alias)) {
-          console.log(`[HIT] alias "${alias}" => ${c.id} ${c.name}`);
-          return { id: c.id, name: c.name };
+    for (const c of arr) {
+      const aliases = Array.isArray(c.aliases)
+        ? c.aliases
+        : (typeof c.aliases === "string" && c.aliases.trim()
+            ? [c.aliases]
+            : []);
+
+      if (!aliases.length) continue;
+
+      for (const a of aliases) {
+        const aRaw = String(a || "").toLowerCase();
+        if (!aRaw) continue;
+
+        const aCompact = aRaw.replace(/\s+/g, "");
+        if (raw.includes(aRaw) || compact.includes(aCompact)) {
+          console.log("✅ detectCustomer hit:", c.name);
+          return { id: c.id ?? null, name: c.name ?? null };
         }
       }
     }
+    console.warn("⚠ detectCustomer: no match");
   } catch (e) {
     console.error("detectCustomer error:", e);
   }
