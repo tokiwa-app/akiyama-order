@@ -1,20 +1,9 @@
-// afterProcess.js
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 
-// ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
 
-/** ================= MAIN ENTRY =================
- * index.js の saveMessageDoc() 直後に呼ばれる想定
- * - PDF/TIFF は 非同期OCR（asyncBatchAnnotateFiles）
- * - 画像は 同期OCR（textDetection）
- * - 管理番号：既存抽出なければ 6桁HEX でグローバル増分
- * - 図面判定：ゆるめヒューリスティクス（寸法/Φ/板厚/図面/縮尺/レーザ/曲/まげ）
- * - 顧客特定：system_configs/system_customers_master を走査（aliases 含む単純含有チェック）
- * - Firestore: managementNo / customer / 工程TODO / ocr.fullText / ocr.topText を保存
- */
 export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
     const msgRef = firestore.collection("messages").doc(messageId);
@@ -24,12 +13,8 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const data = msgSnap.data();
     const attachments = data.attachments || [];
 
-    // === 0) OCR ===
-    const { fullOcrText, topOcrText, hasDrawing } = await runOcrAndDetectDrawing(
-      attachments
-    );
+    const { fullOcrText, topOcrText } = await runOcrAndDetectDrawing(attachments);
 
-    // メール本文は index.js 側で保存済み。ここでは OCR結果を統合。
     const textPool = [
       data.subject || "",
       data.textPlain || "",
@@ -37,11 +22,9 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       fullOcrText || "",
     ].join(" ");
 
-    // === 1) 管理番号 ===
     const existing = extractManagementNo(textPool);
     const managementNo = await ensureManagementNo(firestore, existing);
 
-    // === 2) 顧客特定 ===
     let customer = null;
 
     // (A) OCRの1行目優先
@@ -53,10 +36,9 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       customer = await detectCustomer(firestore, textPool);
     }
 
-    // === 3) 図面・工程TODO ===
-    const process = detectProcessTodoByText(fullOcrText);
+    // (C) 工程TODO判定（レーザ・まげ・曲）
+    const process = detectProcessTodo(fullOcrText);
 
-    // === 4) Firestore反映 ===
     await msgRef.set(
       {
         managementNo,
@@ -67,7 +49,6 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         ocr: {
           fullText: fullOcrText || "",
           topText: topOcrText || "",
-          hasDrawing: !!process.hasDrawing,
           at: Date.now(),
         },
         processedAt: Date.now(),
@@ -76,7 +57,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     );
 
     console.log(
-      `✅ afterProcess done id=${messageId} mgmt=${managementNo} drawing=${process.hasDrawing}`
+      `✅ afterProcess done id=${messageId} mgmt=${managementNo} customer=${customer?.name || "-"}`
     );
   } catch (e) {
     console.error("afterProcess error:", e);
@@ -161,31 +142,50 @@ async function ocrImageText(gcsUri) {
   return res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || "";
 }
 
-// === 添付1枚目だけOCR実行 ===
 async function runOcrAndDetectDrawing(attachments) {
-  if (!attachments?.length) return { fullOcrText: "", topOcrText: "", hasDrawing: false };
+  let fullOcrText = "";
+  let topOcrText = "";
 
-  const uri = attachments.find((x) => x?.startsWith("gs://"));
-  if (!uri) return { fullOcrText: "", topOcrText: "", hasDrawing: false };
+  for (const uri of attachments || []) {
+    if (!uri?.startsWith("gs://")) continue;
 
-  const lower = uri.toLowerCase();
-  let text = "";
-  try {
-    if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
-      text = await ocrPdfFirstPageText(uri);
-    } else {
-      text = await ocrImageText(uri);
+    const lower = uri.toLowerCase();
+    let text = "";
+    try {
+      if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
+        text = await ocrPdfFirstPageText(uri);
+      } else {
+        text = await ocrImageText(uri);
+      }
+    } catch (e) {
+      console.warn("OCR failed:", uri, e?.message || e);
+      continue;
     }
-  } catch (e) {
-    console.warn("OCR failed:", uri, e?.message || e);
+    if (!text) continue;
+
+    fullOcrText += (fullOcrText ? "\n" : "") + text;
+    const top = text.split("\n")[0] || "";
+    topOcrText += (topOcrText ? " " : "") + top;
   }
 
-  const topOcrText = text.split("\n")[0] || "";
-  const hasDrawing = detectProcessTodoByText(text).hasDrawing;
-  return { fullOcrText: text, topOcrText, hasDrawing };
+  return { fullOcrText, topOcrText };
 }
 
 /** ================ 顧客マスタ照合 ================= */
+function coerceAliases(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) {
+    return val.map((s) => String(s ?? "").trim()).filter((s) => s.length > 0);
+  }
+  if (typeof val === "string") {
+    return val
+      .split(/[,\u3001\uFF0C，、｡]/g)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return [];
+}
+
 async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
@@ -194,17 +194,18 @@ async function detectCustomer(firestore, sourceText) {
       .get();
     if (!snap.exists) return null;
 
-    const arr = Object.values(snap.data() || {});
-    const searchSource = (sourceText || "").toLowerCase();
+    const data = snap.data() || {};
+    const arr = Array.isArray(data) ? data : Object.values(data);
+
+    const src = String(sourceText || "").toLowerCase();
 
     for (const c of arr) {
-      const aliases = Array.isArray(c.aliases) ? c.aliases : [];
-      for (const alias of aliases) {
-        if (!alias) continue;
-        if (searchSource.includes(String(alias).toLowerCase())) {
-          console.log(`✅ Customer matched: ${alias} -> ${c.name}`);
-          return { id: c.id, name: c.name };
-        }
+      const aliases = coerceAliases(c?.aliases).map((a) => a.toLowerCase());
+      if (aliases.length === 0) continue;
+
+      if (aliases.some((a) => a && src.includes(a))) {
+        console.log(`✅ Customer matched by alias: [${aliases.join(" | ")}] -> ${c.name}`);
+        return { id: c.id ?? null, name: c.name ?? null };
       }
     }
   } catch (e) {
@@ -213,14 +214,11 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/** ================ 図面・工程判定 ================= */
-function detectProcessTodoByText(fullText = "") {
-  const t = fullText.toLowerCase();
-  const hasLaserOrBend = /(レーザ|曲|まげ|φ)/i.test(t);
-
-  if (hasLaserOrBend) {
+/** ================ 工程TODO判定 ================= */
+function detectProcessTodo(text = "") {
+  const lower = text.toLowerCase();
+  if (/(レーザ|曲|まげ)/.test(lower)) {
     return {
-      hasDrawing: true,
       processStatusLaser: "todo",
       processStatusBending: "todo",
       processStatusSeichaku: "none",
@@ -228,7 +226,6 @@ function detectProcessTodoByText(fullText = "") {
     };
   } else {
     return {
-      hasDrawing: false,
       processStatusLaser: "none",
       processStatusBending: "none",
       processStatusSeichaku: "todo",
