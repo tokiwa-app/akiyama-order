@@ -4,6 +4,7 @@ import { Storage } from "@google-cloud/storage";
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
 
+/** ================= MAIN ENTRY ================= */
 export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
     const msgRef = firestore.collection("messages").doc(messageId);
@@ -13,8 +14,10 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const data = msgSnap.data();
     const attachments = data.attachments || [];
 
+    // === 0) OCR（PDF/TIFF/画像） ===
     const { fullOcrText, topOcrText } = await runOcrAndDetectDrawing(attachments);
 
+    // === 1) 管理番号 ===
     const textPool = [
       data.subject || "",
       data.textPlain || "",
@@ -25,6 +28,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const existing = extractManagementNo(textPool);
     const managementNo = await ensureManagementNo(firestore, existing);
 
+    // === 2) 顧客特定 ===
     let customer = null;
 
     // (A) OCRの1行目優先
@@ -36,9 +40,10 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       customer = await detectCustomer(firestore, textPool);
     }
 
-    // (C) 工程TODO判定（レーザ・まげ・曲）
+    // === 3) 工程TODO判定（レーザ・まげ・曲） ===
     const process = detectProcessTodo(fullOcrText);
 
+    // === 4) Firestore反映 ===
     await msgRef.set(
       {
         managementNo,
@@ -172,20 +177,6 @@ async function runOcrAndDetectDrawing(attachments) {
 }
 
 /** ================ 顧客マスタ照合 ================= */
-function coerceAliases(val) {
-  if (!val) return [];
-  if (Array.isArray(val)) {
-    return val.map((s) => String(s ?? "").trim()).filter((s) => s.length > 0);
-  }
-  if (typeof val === "string") {
-    return val
-      .split(/[,\u3001\uFF0C，、｡]/g)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-  }
-  return [];
-}
-
 async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
@@ -194,23 +185,26 @@ async function detectCustomer(firestore, sourceText) {
       .get();
     if (!snap.exists) return null;
 
-    const data = snap.data() || {};
-    const arr = Array.isArray(data) ? data : Object.values(data);
+    const data = snap.data();
+    const customers = Array.isArray(data.customers) ? data.customers : [];
+    if (customers.length === 0) return null;
 
     const src = String(sourceText || "").toLowerCase();
 
-    for (const c of arr) {
-      const aliases = coerceAliases(c?.aliases).map((a) => a.toLowerCase());
-      if (aliases.length === 0) continue;
+    for (const c of customers) {
+      const aliases = Array.isArray(c.aliases)
+        ? c.aliases.map((a) => String(a).toLowerCase())
+        : [];
 
       if (aliases.some((a) => a && src.includes(a))) {
-        console.log(`✅ Customer matched by alias: [${aliases.join(" | ")}] -> ${c.name}`);
+        console.log(`✅ Customer matched: [${aliases.join(", ")}] -> ${c.name}`);
         return { id: c.id ?? null, name: c.name ?? null };
       }
     }
   } catch (e) {
     console.error("detectCustomer error:", e);
   }
+
   return null;
 }
 
