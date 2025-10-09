@@ -39,15 +39,15 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       customer = await detectCustomer(firestore, topOcrText);
     }
 
-    // B. 全文でフォールバック
+    // B. 全文フォールバック
     if (!customer) {
       customer = await detectCustomer(firestore, textPool);
     }
 
-    // === 3) 工程TODO判定（図面記述による推定） ===
+    // === 3) 工程TODO（文字ベース） ===
     const process = detectProcessTodoByText(textPool);
 
-    // === 4) Firestore反映 ===
+    // === 4) Firestore 反映 ===
     await msgRef.set(
       {
         managementNo,
@@ -179,7 +179,7 @@ async function runOcrAndDetectDrawing(attachments) {
   return { fullOcrText, topOcrText };
 }
 
-/** ================ 顧客マスタ照合 ================= */
+/** ================ 顧客マスタ照合（部分一致・図面検出方式） ================= */
 async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
@@ -189,17 +189,11 @@ async function detectCustomer(firestore, sourceText) {
     if (!snap.exists) return null;
 
     const arr = Object.values(snap.data() || {});
-    const searchSource = (sourceText || "").replace(/\s+/g, "").toLowerCase();
+    const src = (sourceText || "").toLowerCase();
 
     for (const c of arr) {
       const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
-      if (
-        aliases.length &&
-        aliases.some((a) => {
-          const cleanedAlias = (a || "").replace(/\s+/g, "").toLowerCase();
-          return cleanedAlias && searchSource.includes(cleanedAlias);
-        })
-      ) {
+      if (aliases.some((alias) => alias && src.includes(alias))) {
         return { id: c.id, name: c.name };
       }
     }
@@ -212,7 +206,6 @@ async function detectCustomer(firestore, sourceText) {
 /** ================ 工程TODO判定（文字ベース） ================= */
 function detectProcessTodoByText(fullText = "") {
   const t = fullText.toLowerCase();
-  // 「レーザ」「曲」「まげ」「r」「φ」いずれかを含めばレーザー・曲げ扱い
   const hasLaserOrBend = /(レーザ|曲|まげ|φ|r)/i.test(t);
 
   if (hasLaserOrBend) {
