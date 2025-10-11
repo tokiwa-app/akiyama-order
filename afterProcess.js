@@ -17,10 +17,8 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const data = msgSnap.data();
     const attachments = data.attachments || [];
 
-    // === 0) OCR（PDF/TIFF/画像に対応） ===
-    const { fullOcrText, topOcrText, hasDrawing } = await runOcrAndDetectDrawing(
-      attachments
-    );
+    // === 0) OCR（PDF/TIFF/画像）→ PDFは1ページ目のみ ===
+    const fullOcrText = await runOcr(attachments);
 
     const textPool = [
       data.subject || "",
@@ -36,18 +34,16 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     // === 2) 顧客特定（冒頭100文字 → 全文フォールバック） ===
     const head100 = String(fullOcrText || textPool).slice(0, 100);
     let customer = null;
+    if (head100) customer = await detectCustomer(firestore, head100);
+    if (!customer) customer = await detectCustomer(firestore, textPool);
 
-    // A. 冒頭100文字優先
-    if (head100) {
-      customer = await detectCustomer(firestore, head100);
-    }
-    // B. ヒットしなければ全文で検索
-    if (!customer) {
-      customer = await detectCustomer(firestore, textPool);
-    }
-
-    // === 3) 工程TODO（図面有無） ===
-    const process = detectProcessTodo(fullOcrText);
+    // === 3) 工程TODOは行わない（すべて "none" に固定） ===
+    const processFixed = {
+      processStatusLaser: "none",
+      processStatusBending: "none",
+      processStatusSeichaku: "none",
+      processStatusShear: "none",
+    };
 
     // === 4) Firestore 反映 ===
     await msgRef.set(
@@ -56,11 +52,9 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         parentManagementNo: managementNo,
         customerId: customer?.id || null,
         customerName: customer?.name || null,
-        ...process,
+        ...processFixed,
         ocr: {
           fullText: fullOcrText || "",
-          topText: topOcrText || "",
-          hasDrawing: !!hasDrawing,
           at: Date.now(),
         },
         processedAt: Date.now(),
@@ -114,18 +108,21 @@ function parseGsUri(uri) {
   return m ? { bucket: m[1], path: m[2] } : null;
 }
 
+// PDF/TIFF は「1ページ目だけ」OCR（非同期バッチ）
 async function ocrPdfFirstPageText(gcsUri) {
   const info = parseGsUri(gcsUri);
   if (!info) return "";
   const tmpPrefix = `_vision_out/${Date.now()}_${Math.random().toString(36).slice(2)}/`;
   const outUri = `gs://${info.bucket}/${tmpPrefix}`;
 
+  // ★ 1ページ目だけ解析
   const [op] = await client.asyncBatchAnnotateFiles({
     requests: [
       {
         inputConfig: { gcsSource: { uri: gcsUri }, mimeType: "application/pdf" },
         features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
         outputConfig: { gcsDestination: { uri: outUri }, batchSize: 1 },
+        pages: [1],
       },
     ],
   });
@@ -134,8 +131,8 @@ async function ocrPdfFirstPageText(gcsUri) {
 
   const [files] = await storage.bucket(info.bucket).getFiles({ prefix: tmpPrefix });
   if (!files.length) return "";
-  const [buf] = await files[0].download();
 
+  const [buf] = await files[0].download();
   await Promise.all(files.map((f) => f.delete().catch(() => {})));
 
   const json = JSON.parse(buf.toString());
@@ -148,14 +145,14 @@ async function ocrImageText(gcsUri) {
   return res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || "";
 }
 
-async function runOcrAndDetectDrawing(attachments) {
+// 図面判定なし・工程判定なし・1ページOCRのみ
+async function runOcr(attachments) {
   let fullOcrText = "";
-  let topOcrText = "";
-  let hasDrawing = false;
 
   for (const uri of attachments || []) {
     if (!uri?.startsWith("gs://")) continue;
     const lower = uri.toLowerCase();
+
     let text = "";
     try {
       if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
@@ -170,26 +167,9 @@ async function runOcrAndDetectDrawing(attachments) {
     if (!text) continue;
 
     fullOcrText += (fullOcrText ? "\n" : "") + text;
-    const top = text.split("\n")[0] || "";
-    topOcrText += (topOcrText ? " " : "") + top;
-
-    if (isDrawingByHeuristics(text)) hasDrawing = true;
   }
 
-  return { fullOcrText, topOcrText, hasDrawing };
-}
-
-/** ================ 図面判定 ================= */
-function isDrawingByHeuristics(text) {
-  const top = text.split("\n").slice(0, 60).join(" ");
-  let score = 0;
-  if (/(図面|図番|外形|寸法|公差|材質|板厚|展開|曲げ|穴径|仕上|溶接)/i.test(top)) score++;
-  if (/[φΦØ]/.test(top)) score++;
-  if (/\bR\s*\d+/.test(top)) score++;
-  if (/\bt\s*\d+(\.\d+)?\b/i.test(top)) score++;
-  if (/\bA3\b|\bA4\b|\bSCALE\b|縮尺/i.test(top)) score++;
-  if (/\b\d+(\.\d+)?\s*mm\b/i.test(top)) score++;
-  return score >= 2;
+  return fullOcrText;
 }
 
 /** ================ 顧客マスタ照合 ================= */
@@ -219,25 +199,4 @@ async function detectCustomer(firestore, sourceText) {
     console.error("detectCustomer error:", e);
   }
   return null;
-}
-
-/** ================ 工程TODO判定 ================= */
-function detectProcessTodo(text) {
-  const normalized = text || "";
-  const laserRegex = /(レーザ|曲|まげ|Φ|φ)/i;
-  if (laserRegex.test(normalized)) {
-    return {
-      processStatusLaser: "todo",
-      processStatusBending: "todo",
-      processStatusSeichaku: "none",
-      processStatusShear: "none",
-    };
-  } else {
-    return {
-      processStatusLaser: "none",
-      processStatusBending: "none",
-      processStatusSeichaku: "todo",
-      processStatusShear: "todo",
-    };
-  }
 }
