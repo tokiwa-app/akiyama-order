@@ -17,7 +17,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const data = msgSnap.data();
     const attachments = data.attachments || [];
 
-    // === 0) OCR（PDF/TIFF/画像）→ PDFは1ページ目のみ ===
+    // === 0) OCR（PDF/TIFF/画像）→ PDF/TIFFは1ページ目のみ ===
     const fullOcrText = await runOcr(attachments);
 
     const textPool = [
@@ -45,7 +45,20 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       processStatusShear: "none",
     };
 
-    // === 4) Firestore 反映 ===
+    // === 4) 添付ごとに GCS V4 署名URL（7日）を発行 ===
+    const signedUrls = [];
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7日
+    for (const gsUri of attachments) {
+      if (!gsUri?.startsWith("gs://")) continue;
+      try {
+        const url = await getSignedUrlForGsUri(gsUri, expiresAt);
+        signedUrls.push({ gsUri, signedUrl: url, expiresAt });
+      } catch (e) {
+        console.warn("signedUrl generation failed:", gsUri, e?.message || e);
+      }
+    }
+
+    // === 5) Firestore 反映 ===
     await msgRef.set(
       {
         managementNo,
@@ -57,15 +70,39 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
           fullText: fullOcrText || "",
           at: Date.now(),
         },
+        signedUrls, // ← ここに署名URL一覧を保存
         processedAt: Date.now(),
       },
       { merge: true }
     );
 
-    console.log(`✅ afterProcess done id=${messageId} mgmt=${managementNo}`);
+    console.log(
+      `✅ afterProcess done id=${messageId} mgmt=${managementNo} signed=${signedUrls.length}`
+    );
   } catch (e) {
     console.error("afterProcess error:", e);
   }
+}
+
+/** ================= 署名URLユーティリティ ================= */
+function parseGsUri(uri) {
+  const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
+  return m ? { bucket: m[1], path: m[2] } : null;
+}
+
+async function getSignedUrlForGsUri(gsUri, expiresAtMs) {
+  const info = parseGsUri(gsUri);
+  if (!info) throw new Error("invalid gs:// uri");
+  const [url] = await storage
+    .bucket(info.bucket)
+    .file(info.path)
+    .getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: new Date(expiresAtMs), // Date or ms epoch
+      // contentType / contentDisposition は必要に応じて GCS 側メタに設定を推奨
+    });
+  return url;
 }
 
 /** ================= 管理番号 ================= */
@@ -85,7 +122,8 @@ export async function ensureManagementNo(firestore, extracted) {
   return await firestore.runTransaction(async (tx) => {
     const snap = await tx.get(seqRef);
     const current = snap.exists && snap.data()?.v ? Number(snap.data().v) : 0;
-    const digits = snap.exists && snap.data()?.digits ? Number(snap.data().digits) : 6;
+    const digits =
+      snap.exists && snap.data()?.digits ? Number(snap.data().digits) : 6;
 
     let next = current + 1;
     const max = Math.pow(16, digits);
@@ -96,43 +134,47 @@ export async function ensureManagementNo(firestore, extracted) {
       newDigits = digits + 1;
     }
 
-    tx.set(seqRef, { v: next, digits: newDigits, updatedAt: Date.now() }, { merge: true });
+    tx.set(
+      seqRef,
+      { v: next, digits: newDigits, updatedAt: Date.now() },
+      { merge: true }
+    );
 
     return next.toString(16).toUpperCase().padStart(newDigits, "0");
   });
 }
 
 /** ================ OCRユーティリティ ================= */
-function parseGsUri(uri) {
-  const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
-  return m ? { bucket: m[1], path: m[2] } : null;
-}
 
-// PDF/TIFF は「1ページ目だけ」OCR（非同期バッチ）
-async function ocrPdfFirstPageText(gcsUri) {
+// PDF/TIFF を 1ページ目だけ OCR（非同期バッチ）
+async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const info = parseGsUri(gcsUri);
   if (!info) return "";
-  const tmpPrefix = `_vision_out/${Date.now()}_${Math.random().toString(36).slice(2)}/`;
+  const tmpPrefix = `_vision_out/${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2)}/`;
   const outUri = `gs://${info.bucket}/${tmpPrefix}`;
 
-  // ★ 1ページ目だけ解析
   const [op] = await client.asyncBatchAnnotateFiles({
     requests: [
       {
-        inputConfig: { gcsSource: { uri: gcsUri }, mimeType: "application/pdf" },
+        inputConfig: { gcsSource: { uri: gcsUri }, mimeType }, // ← 可変
         features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
         outputConfig: { gcsDestination: { uri: outUri }, batchSize: 1 },
-        pages: [1],
+        pages: [1], // 1ページ目のみ
       },
     ],
   });
 
   await op.promise();
 
-  const [files] = await storage.bucket(info.bucket).getFiles({ prefix: tmpPrefix });
+  const [files] = await storage
+    .bucket(info.bucket)
+    .getFiles({ prefix: tmpPrefix });
   if (!files.length) return "";
 
   const [buf] = await files[0].download();
+  // 後始末（出力JSON掃除）
   await Promise.all(files.map((f) => f.delete().catch(() => {})));
 
   const json = JSON.parse(buf.toString());
@@ -142,7 +184,9 @@ async function ocrPdfFirstPageText(gcsUri) {
 
 async function ocrImageText(gcsUri) {
   const [res] = await client.textDetection(gcsUri);
-  return res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || "";
+  return (
+    res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || ""
+  );
 }
 
 // 図面判定なし・工程判定なし・1ページOCRのみ
@@ -155,8 +199,10 @@ async function runOcr(attachments) {
 
     let text = "";
     try {
-      if (lower.endsWith(".pdf") || lower.endsWith(".tif") || lower.endsWith(".tiff")) {
-        text = await ocrPdfFirstPageText(uri);
+      if (lower.endsWith(".pdf")) {
+        text = await ocrFirstPageFromFile(uri, "application/pdf");
+      } else if (lower.endsWith(".tif") || lower.endsWith(".tiff")) {
+        text = await ocrFirstPageFromFile(uri, "image/tiff");
       } else {
         text = await ocrImageText(uri);
       }
