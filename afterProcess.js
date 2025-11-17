@@ -30,12 +30,10 @@ export async function runAfterProcess({ messageId, firestore }) {
     ].join(" ");
 
     // === 1) 管理番号決定ロジック（AKSNO優先 / 7桁固定） ===
-    // 1-1) 本文から AKSNO の直後7桁を抽出
-    const aksCandidate = extractAksNo7(bodyPool); // 例: "AKSNO: ABC1234" -> "ABC1234"
+    const aksCandidate = extractAksNo7(bodyPool);
     let managementNo = null;
 
     if (aksCandidate) {
-      // 1-2) 既存の messages に同じ管理番号があるか確認
       const existingSnap = await firestore
         .collection("messages")
         .where("managementNo", "==", aksCandidate)
@@ -43,22 +41,21 @@ export async function runAfterProcess({ messageId, firestore }) {
         .get();
 
       if (!existingSnap.empty) {
-        managementNo = aksCandidate; // 既存のものを採用
+        managementNo = aksCandidate;
       }
     }
 
-    // 1-3) 見つからない or 未登録なら新規採番（7桁固定）
     if (!managementNo) {
       managementNo = await ensureManagementNo7(firestore);
     }
 
-    // === 2) 顧客特定（冒頭100文字 → 全文フォールバック） ===
+    // === 2) 顧客特定 ===
     const head100 = String(fullOcrText || bodyPool).slice(0, 100);
     let customer = null;
     if (head100) customer = await detectCustomer(firestore, head100);
     if (!customer) customer = await detectCustomer(firestore, bodyPool);
 
-    // === 3) Firestore 反映（工程・署名URLは保存しない） ===
+    // === 3) Firestore 更新 ===
     await msgRef.set(
       {
         managementNo,
@@ -67,7 +64,7 @@ export async function runAfterProcess({ messageId, firestore }) {
         customerName: customer?.name || null,
         ocr: {
           fullText: fullOcrText || "",
-          rotation: firstPageRotation || 0, // ★ 追加：1ページ目の推定回転角（0/90/180/270）
+          rotation: firstPageRotation || 0,
           at: Date.now(),
         },
         processedAt: Date.now(),
@@ -78,6 +75,59 @@ export async function runAfterProcess({ messageId, firestore }) {
     console.log(
       `✅ afterProcess done id=${messageId} mgmt=${managementNo} rot=${firstPageRotation}`
     );
+
+    // ======================================================
+    // === 4) ★ RDB（Cloud Run API）へ同期 POST /actions ★===
+    // ======================================================
+    try {
+      if (!API_BASE_URL) {
+        console.warn("NEXT_PUBLIC_API_BASE_URL が未設定のため RDB同期スキップ");
+      } else {
+        // 発生日（メール受信日時）
+        let occurredAt = new Date();
+        const receivedAt = data.receivedAt;
+
+        if (receivedAt && typeof receivedAt.toDate === "function") {
+          occurredAt = receivedAt.toDate();
+        } else if (receivedAt instanceof Date) {
+          occurredAt = receivedAt;
+        } else if (data.internalDate) {
+          occurredAt = new Date(data.internalDate);
+        }
+
+        // RDB に送る JSON（最小構成）
+        const payload = {
+          tenantId: "AKIYAMA",
+          action: {
+            action_type: "OTHER",
+            partner_id: customer?.id || null,
+            occurred_at: occurredAt.toISOString(),
+            main_target_id: managementNo,
+            main_target_name: data.subject || "",
+            external_ref_id: messageId, // ★ Firestore の messageId
+            status: "DONE",
+          },
+          lines: [],
+        };
+
+        const res = await fetch(`${API_BASE_URL}/actions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          console.error("❌ RDB同期失敗:", res.status, text);
+        } else {
+          console.log("✅ RDB同期 OK (POST /actions)");
+        }
+      }
+    } catch (e) {
+      console.error("RDB同期中エラー:", e);
+    }
+    // ======================================================
+
   } catch (e) {
     console.error("afterProcess error:", e);
   }
@@ -91,7 +141,7 @@ export function extractAksNo7(text = "") {
 }
 
 export async function ensureManagementNo7(firestore) {
-  const FIXED_DIGITS = 7; // 7桁固定（16進）
+  const FIXED_DIGITS = 7;
 
   const seqRef = firestore
     .collection("system_configs")
@@ -104,13 +154,9 @@ export async function ensureManagementNo7(firestore) {
 
     let next = current + 1;
     const max = Math.pow(16, digits);
-    if (next >= max) next = 1; // 桁上げはせず 7桁でループ
+    if (next >= max) next = 1;
 
-    tx.set(
-      seqRef,
-      { v: next, digits, updatedAt: Date.now() },
-      { merge: true }
-    );
+    tx.set(seqRef, { v: next, digits, updatedAt: Date.now() }, { merge: true });
 
     return next.toString(16).toUpperCase().padStart(digits, "0");
   });
@@ -123,8 +169,8 @@ function angleDeg(p1 = {}, p2 = {}) {
   const dx = (p2.x ?? 0) - (p1.x ?? 0);
   const dy = (p2.y ?? 0) - (p1.y ?? 0);
   const rad = Math.atan2(dy, dx);
-  let deg = (rad * 180) / Math.PI; // -180..180
-  if (deg < 0) deg += 360; // 0..360
+  let deg = (rad * 180) / Math.PI;
+  if (deg < 0) deg += 360;
   return deg;
 }
 
@@ -159,7 +205,7 @@ function estimatePageRotationFromBlocks(page) {
   return Number(entries[0]?.[0] ?? 0);
 }
 
-// PDF/TIFF を 1ページ目だけ OCR（非同期バッチ）＋ 回転角推定
+// PDF/TIFF → 1ページ目 OCR
 async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const info = parseGsUri(gcsUri);
   if (!info) return { text: "", rotation: 0 };
@@ -175,7 +221,7 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
         inputConfig: { gcsSource: { uri: gcsUri }, mimeType },
         features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
         outputConfig: { gcsDestination: { uri: outUri }, batchSize: 1 },
-        pages: [1], // 1ページ目のみ
+        pages: [1],
       },
     ],
   });
@@ -188,21 +234,20 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   if (!files.length) return { text: "", rotation: 0 };
 
   const [buf] = await files[0].download();
-  // 出力JSON削除（best effort）
+
   await Promise.all(files.map((f) => f.delete().catch(() => {})));
 
   const json = JSON.parse(buf.toString());
   const resp = json.responses?.[0];
   const text = resp?.fullTextAnnotation?.text || "";
 
-  // ページ（1ページ目）の頂点から回転角推定
   const page = resp?.fullTextAnnotation?.pages?.[0];
   const rotation = page ? estimatePageRotationFromBlocks(page) : 0;
 
   return { text, rotation };
 }
 
-// 画像を OCR（documentTextDetection に変更してページ情報を取得）＋ 回転角推定
+// 画像 OCR（documentTextDetection）
 async function ocrImageTextWithRotation(gcsUri) {
   const [res] = await client.documentTextDetection(gcsUri);
   const text =
@@ -212,9 +257,10 @@ async function ocrImageTextWithRotation(gcsUri) {
   return { text, rotation };
 }
 
+// 全添付の OCR
 async function runOcr(attachments) {
   let fullOcrText = "";
-  let firstPageRotation = null; // 最初に決まった回転角（1枚目相当）
+  let firstPageRotation = null;
 
   for (const uri of attachments || []) {
     if (!uri?.startsWith("gs://")) continue;
@@ -232,10 +278,8 @@ async function runOcr(attachments) {
 
       if (!r?.text) continue;
 
-      // OCR全文を連結
       fullOcrText += (fullOcrText ? "\n" : "") + r.text;
 
-      // “1枚目だけ” の回転角として、最初に得られたものを採用
       if (firstPageRotation == null) {
         firstPageRotation = r.rotation ?? 0;
       }
@@ -277,7 +321,7 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/** ================= GCS URIパース ================= */
+/** ================= GCS URI パース ================= */
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
