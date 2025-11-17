@@ -1,6 +1,8 @@
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "";
+
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
