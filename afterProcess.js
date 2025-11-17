@@ -83,7 +83,8 @@ export async function runAfterProcess({ messageId, firestore }) {
       if (!API_BASE_URL) {
         console.warn("NEXT_PUBLIC_API_BASE_URL が未設定のため RDB同期スキップ");
       } else {
-        // 発生日（メール受信日時）
+
+        // === 発生日（メールの受信日時） ===
         let occurredAt = new Date();
         const receivedAt = data.receivedAt;
 
@@ -95,21 +96,23 @@ export async function runAfterProcess({ messageId, firestore }) {
           occurredAt = new Date(data.internalDate);
         }
 
-        // RDB に送る JSON（最小構成）
+        // === 必須項目＋最低構成の同期内容 ===
         const payload = {
           tenantId: "AKIYAMA",
           action: {
-            action_type: "OTHER",
-            partner_id: customer?.id || null,
-            occurred_at: occurredAt.toISOString(),
-            main_target_id: managementNo,
-            main_target_name: data.subject || "",
-            external_ref_id: messageId, // ★ Firestore の messageId
-            status: "DONE",
+            action_type: "WORK",                  // ★ 必須（大文字）
+            occurred_at: occurredAt.toISOString(),// ★ 必須
+            status: "NEW",                        // ★ 必須
+
+            external_ref_id: messageId,           // Firestore ID（同期キー）
+            partner_id: customer?.id || null,     // 顧客ID（なくてもOK）
+            main_target_id: managementNo,         // 管理番号（任意だが付けておく）
+            main_target_name: customer?.name || null, // 名前（任意）
           },
           lines: [],
         };
 
+        // POST /actions
         const res = await fetch(`${API_BASE_URL}/actions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -120,7 +123,7 @@ export async function runAfterProcess({ messageId, firestore }) {
           const text = await res.text().catch(() => "");
           console.error("❌ RDB同期失敗:", res.status, text);
         } else {
-          console.log("✅ RDB同期 OK (POST /actions)");
+          console.log("✅ RDB同期 OK");
         }
       }
     } catch (e) {
