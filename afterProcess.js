@@ -1,8 +1,6 @@
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "";
-
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
@@ -75,61 +73,6 @@ export async function runAfterProcess({ messageId, firestore }) {
     console.log(
       `✅ afterProcess done id=${messageId} mgmt=${managementNo} rot=${firstPageRotation}`
     );
-
-    // ======================================================
-    // === 4) ★ RDB（Cloud Run API）へ同期 POST /actions ★===
-    // ======================================================
-    try {
-      if (!API_BASE_URL) {
-        console.warn("NEXT_PUBLIC_API_BASE_URL が未設定のため RDB同期スキップ");
-      } else {
-
-        // === 発生日（メールの受信日時） ===
-        let occurredAt = new Date();
-        const receivedAt = data.receivedAt;
-
-        if (receivedAt && typeof receivedAt.toDate === "function") {
-          occurredAt = receivedAt.toDate();
-        } else if (receivedAt instanceof Date) {
-          occurredAt = receivedAt;
-        } else if (data.internalDate) {
-          occurredAt = new Date(data.internalDate);
-        }
-
-        // === 必須項目＋最低構成の同期内容 ===
-        const payload = {
-          tenantId: "AKIYAMA",
-          action: {
-            action_type: "WORK",                  // ★ 必須（大文字）
-            occurred_at: occurredAt.toISOString(),// ★ 必須
-            status: "NEW",                        // ★ 必須
-
-            external_ref_id: messageId,           // Firestore ID（同期キー）
-            partner_id: customer?.id || null,     // 顧客ID（なくてもOK）
-            main_target_id: managementNo,         // 管理番号（任意だが付けておく）
-            main_target_name: customer?.name || null, // 名前（任意）
-          },
-          lines: [],
-        };
-
-        // POST /actions
-        const res = await fetch(`${API_BASE_URL}/actions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          console.error("❌ RDB同期失敗:", res.status, text);
-        } else {
-          console.log("✅ RDB同期 OK");
-        }
-      }
-    } catch (e) {
-      console.error("RDB同期中エラー:", e);
-    }
-    // ======================================================
 
   } catch (e) {
     console.error("afterProcess error:", e);
@@ -254,7 +197,9 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
 async function ocrImageTextWithRotation(gcsUri) {
   const [res] = await client.documentTextDetection(gcsUri);
   const text =
-    res.fullTextAnnotation?.text || res.textAnnotations?.[0]?.description || "";
+    res.fullTextAnnotation?.text ||
+    res.textAnnotations?.[0]?.description ||
+    "";
   const page = res.fullTextAnnotation?.pages?.[0];
   const rotation = page ? estimatePageRotationFromBlocks(page) : 0;
   return { text, rotation };
@@ -288,7 +233,6 @@ async function runOcr(attachments) {
       }
     } catch (e) {
       console.warn("OCR failed:", uri, e?.message || e);
-      continue;
     }
   }
 
@@ -305,10 +249,14 @@ async function detectCustomer(firestore, sourceText) {
     if (!snap.exists) return null;
 
     const arr = snap.data()?.customers || [];
-    const searchSource = (sourceText || "").replace(/\s+/g, "").toLowerCase();
+    const searchSource = (sourceText || "")
+      .replace(/\s+/g, "")
+      .toLowerCase();
 
     for (const c of arr) {
-      const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
+      const aliases = (c.aliases || []).map((a) =>
+        String(a).toLowerCase()
+      );
       if (
         aliases.some((a) => {
           const cleanedAlias = a.replace(/\s+/g, "");
