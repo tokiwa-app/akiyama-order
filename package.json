@@ -13,6 +13,9 @@
     "@google-cloud/storage": "^7.12.1",
     "@google-cloud/tasks": "^6.2.0",
     "@google-cloud/vision": "^4.3.3",
-    "p-limit": "^4.0.0"
+    "p-limit": "^4.0.0",
+
+    "@supabase/supabase-js": "^2.48.0",
+    "puppeteer": "^22.7.1"
   }
 }
