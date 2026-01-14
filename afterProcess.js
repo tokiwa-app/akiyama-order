@@ -5,6 +5,17 @@ import fs from "fs/promises";
 import puppeteer from "puppeteer";
 import { mirrorMessageToSupabase } from "./supabaseSync.js";
 
+import { Firestore } from "@google-cloud/firestore"; // ★ 追加
+
+// akiyama-system データベース（取引先マスタ用）
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
+const customerDb = new Firestore(
+  FIREBASE_PROJECT_ID
+    ? { projectId: FIREBASE_PROJECT_ID, databaseId: "akiyama-system" }
+    : { databaseId: "akiyama-system" }
+);
+
+
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
@@ -31,12 +42,15 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     }
 
 
+
     // === 本文候補プール（顧客特定などに使用） ===
     const bodyPool = [
+      data.subject || "",     // ★ これ追加
       data.textPlain || "",
       data.textHtml || "",
       fullOcrText || "",
     ].join(" ");
+
 
     // === 1) 管理番号（毎回新規発番）===
     const managementNo = await ensureManagementNo7(firestore);
@@ -227,27 +241,90 @@ async function runOcr(attachments) {
 
 /* ================= 顧客特定 ================= */
 
-async function detectCustomer(firestore, sourceText) {
+async function detectCustomer(_firestore, sourceText) {
   try {
-    const snap = await firestore
-      .collection("system_configs")
-      .doc("system_customers_master")
+    // ★ akiyama-system / jsons / Client Search の JSON を読む
+    const snap = await customerDb
+      .collection("jsons")
+      .doc("Client Search")
       .get();
     if (!snap.exists) return null;
 
-    const arr = snap.data()?.customers || [];
-    const s = (sourceText || "").replace(/\s+/g, "").toLowerCase();
+    const data = snap.data();
+    if (!Array.isArray(data.tables) || !data.tables[0]?.matrix) return null;
 
-    for (const c of arr) {
-      const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
-      if (
-        aliases.some((a) =>
-          s.includes(a.replace(/\s+/g, ""))
-        )
-      ) {
-        return { id: c.id, name: c.name };
+    const matrix = data.tables[0].matrix;
+    if (!matrix || matrix.length < 2) return null;
+
+    const header = matrix[0];
+    const idx = (colName) => header.indexOf(colName);
+
+    const colId          = idx("id");
+    const colName        = idx("name");
+    const colKana        = idx("kana");
+    const colMailAliases = idx("mail_aliases");
+    const colFaxAliases  = idx("fax_aliases");
+    const colNameAliases = idx("name_aliases");
+
+    if (colId === -1 || colName === -1) return null;
+
+    const normalize = (str) =>
+      String(str || "").toLowerCase().replace(/\s+/g, "");
+
+    const normalizeDigits = (str) =>
+      String(str || "").replace(/[^\d]/g, "");
+
+    const textNorm   = normalize(sourceText);
+    const textDigits = normalizeDigits(sourceText);
+
+    const split = (v) =>
+      String(v || "")
+        .split(/[,\s、;／]+/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+    const rows = matrix.slice(1).map((row) => {
+      const id   = row[colId];
+      const name = row[colName];
+
+      const mailAliases = split(row[colMailAliases]);
+      const faxAliases  = split(row[colFaxAliases]);
+      const nameAliases = split(row[colNameAliases]);
+
+      return { id, name, mailAliases, faxAliases, nameAliases };
+    });
+
+    // ① mail エイリアスに含むか（最優先）
+    for (const r of rows) {
+      for (const a of r.mailAliases) {
+        const aNorm = normalize(a);
+        if (aNorm && textNorm.includes(aNorm)) {
+          return { id: r.id, name: r.name };
+        }
       }
     }
+
+    // ② fax 番号エイリアス（数字だけでマッチ）
+    for (const r of rows) {
+      for (const a of r.faxAliases) {
+        const aDigits = normalizeDigits(a);
+        if (aDigits && textDigits.includes(aDigits)) {
+          return { id: r.id, name: r.name };
+        }
+      }
+    }
+
+    // ③ 名前エイリアス（name_aliases のみ）
+    for (const r of rows) {
+      for (const a of r.nameAliases) {
+        const aNorm = normalize(a);
+        if (aNorm && textNorm.includes(aNorm)) {
+          return { id: r.id, name: r.name };
+        }
+      }
+    }
+
+
   } catch (e) {
     console.error("detectCustomer error:", e);
   }
