@@ -24,20 +24,26 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const isFax = data.messageType === "fax";
 
     // === 0) OCR（テキストだけ取得）===
-    const { fullOcrText } = await runOcr(attachments);
+    // メールは OCR しない（FAX のときだけ）
+    let fullOcrText = "";
+    if (isFax) {
+      const ocrRes = await runOcr(attachments);
+      fullOcrText = ocrRes.fullOcrText;
+    }
+
 
     // === 本文候補プール（顧客特定などに使用） ===
     const bodyPool = [
       data.textPlain || "",
       data.textHtml || "",
-      fullOcrText || "",
+       || "",
     ].join(" ");
 
     // === 1) 管理番号（毎回新規発番）===
     const managementNo = await ensureManagementNo7(firestore);
 
     // === 2) 顧客特定 ===
-    const head100 = String(fullOcrText || bodyPool).slice(0, 100);
+    const head100 = String( || bodyPool).slice(0, 100);
     let customer =
       (head100 && (await detectCustomer(firestore, head100))) ||
       (await detectCustomer(firestore, bodyPool));
@@ -85,7 +91,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         customerId: customer?.id || null,
         customerName: customer?.name || null,
         ocr: {
-          fullText: fullOcrText || "",
+          fullText:  || "",
           at: Date.now(),
         },
         mainPdfPath: mainPdfPath || null,
@@ -100,7 +106,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       messageId,
       data: {
         ...data,
-        ocr: { fullText: fullOcrText },
+        ocr: { fullText:  },
         mainPdfPath,
         mainPdfThumbnailPath,
       },
