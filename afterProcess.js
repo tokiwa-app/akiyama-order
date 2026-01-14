@@ -1,5 +1,6 @@
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
+import { mirrorMessageToSupabase } from "./supabaseSync.js";
 
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
@@ -70,10 +71,19 @@ export async function runAfterProcess({ messageId, firestore }) {
       { merge: true }
     );
 
+    // === 4) Supabase にミラー（別ファイル） ===
+    // Firestore が成功したあとに呼ぶので、本処理を壊さない
+    // 確実に待ちたいなら await をつける、非同期で投げっぱなしならそのまま
+    mirrorMessageToSupabase({
+      messageId,
+      data,
+      managementNo,
+      customer,
+    });
+
     console.log(
       `✅ afterProcess done id=${messageId} mgmt=${managementNo} rot=${firstPageRotation}`
     );
-
   } catch (e) {
     console.error("afterProcess error:", e);
   }
@@ -102,7 +112,11 @@ export async function ensureManagementNo7(firestore) {
     const max = Math.pow(16, digits);
     if (next >= max) next = 1;
 
-    tx.set(seqRef, { v: next, digits, updatedAt: Date.now() }, { merge: true });
+    tx.set(
+      seqRef,
+      { v: next, digits, updatedAt: Date.now() },
+      { merge: true }
+    );
 
     return next.toString(16).toUpperCase().padStart(digits, "0");
   });
@@ -254,9 +268,7 @@ async function detectCustomer(firestore, sourceText) {
       .toLowerCase();
 
     for (const c of arr) {
-      const aliases = (c.aliases || []).map((a) =>
-        String(a).toLowerCase()
-      );
+      const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
       if (
         aliases.some((a) => {
           const cleanedAlias = a.replace(/\s+/g, "");
