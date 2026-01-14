@@ -1,9 +1,11 @@
 // afterProcess.js
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
-import puppeteer from "puppeteer";
-import fs from "fs/promises";
 import { mirrorMessageToSupabase } from "./supabaseSync.js";
+import {
+  renderMailHtmlToPdfAndThumbnail,
+  renderPdfToThumbnail,
+} from "./pdfUtil.js";
 
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
@@ -74,7 +76,11 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
               messageId,
             });
           } catch (e) {
-            console.warn("renderPdfToThumbnail failed:", e);
+            console.error("renderPdfToThumbnail failed:", {
+              pdf: pdfAttachments[0],
+              messageId,
+              error: e,
+            });
           }
         }
       } else {
@@ -217,7 +223,9 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const info = parseGsUri(gcsUri);
   if (!info) return { text: "", rotation: 0 };
 
-  const tmpPrefix = `_vision/${Date.now()}_${Math.random().toString(36).slice(2)}/`;
+  const tmpPrefix = `_vision/${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2)}/`;
   const outUri = `gs://${info.bucket}/${tmpPrefix}`;
 
   const [op] = await client.asyncBatchAnnotateFiles({
@@ -233,7 +241,9 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
 
   await op.promise();
 
-  const [files] = await storage.bucket(info.bucket).getFiles({ prefix: tmpPrefix });
+  const [files] = await storage
+    .bucket(info.bucket)
+    .getFiles({ prefix: tmpPrefix });
   if (!files.length) return { text: "", rotation: 0 };
 
   const [buf] = await files[0].download();
@@ -296,7 +306,7 @@ async function runOcr(attachments) {
   };
 }
 
-/* ================= 顧客特定 ================= */
+/* ================= 顧客特定（オリジナルのまま） ================= */
 
 async function detectCustomer(firestore, sourceText) {
   try {
@@ -325,125 +335,11 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/* ================= GCS URI parse ================= */
+/* ================= GCS URI parse & HTML escape ================= */
 
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
-}
-
-/* ================= HTML→PDF + 300px サムネ ================= */
-
-async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
-  const safeId = sanitizeId(messageId);
-  const pdfTmp = `/tmp/mail-${safeId}.pdf`;
-  const jpgTmp = `/tmp/mail-${safeId}.jpg`;
-
-  const browser = await puppeteer.launch({
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-
-  try {
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
-
-    // PDF作成
-    await page.pdf({
-      path: pdfTmp,
-      format: "A4",
-      printBackground: true,
-    });
-
-    // サムネ生成（幅300px）
-    await page.setViewport({ width: 1024, height: 1400 });
-    const zoom = 300 / 1024;
-
-    await page.evaluate((zoom) => {
-      document.body.style.zoom = zoom;
-    }, zoom);
-
-    await page.screenshot({
-      path: jpgTmp,
-      type: "jpeg",
-      quality: 80,
-      fullPage: true,
-    });
-  } finally {
-    await browser.close().catch(() => {});
-  }
-
-  // GCS アップロード
-  const pdfObjectPath = `mail_rendered/${safeId}.pdf`;
-  const jpgObjectPath = `mail_thumbs/${safeId}.jpg`;
-
-  const pdfBuf = await fs.readFile(pdfTmp);
-  const jpgBuf = await fs.readFile(jpgTmp);
-
-  await bucket.file(pdfObjectPath).save(pdfBuf, { resumable: false, contentType: "application/pdf" });
-  await bucket.file(jpgObjectPath).save(jpgBuf, { resumable: false, contentType: "image/jpeg" });
-
-  return {
-    pdfPath: `gs://${bucket.name}/${pdfObjectPath}`,
-    thumbnailPath: `gs://${bucket.name}/${jpgObjectPath}`,
-  };
-}
-
-/* ================= PDF→300px サムネ ================= */
-
-async function renderPdfToThumbnail({ bucket, pdfGsUri, messageId }) {
-  const info = parseGsUri(pdfGsUri);
-  const safeId = sanitizeId(messageId);
-
-  const localPdf = `/tmp/fax-${safeId}.pdf`;
-  const localJpg = `/tmp/fax-${safeId}.jpg`;
-
-  // PDF ダウンロード
-  await storage.bucket(info.bucket).file(info.path).download({ destination: localPdf });
-
-  const browser = await puppeteer.launch({
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-
-  try {
-    const page = await browser.newPage();
-
-    await page.goto(`file://${localPdf}`, { waitUntil: "networkidle0" });
-
-    // サムネ生成（幅300px）
-    await page.setViewport({ width: 1024, height: 1400 });
-    const zoom = 300 / 1024;
-
-    await page.evaluate((zoom) => {
-      document.body.style.zoom = zoom;
-    }, zoom);
-
-    await page.screenshot({
-      path: localJpg,
-      type: "jpeg",
-      quality: 80,
-      fullPage: true,
-    });
-  } finally {
-    await browser.close().catch(() => {});
-  }
-
-  const thumbObjectPath = `fax_thumbs/${safeId}.jpg`;
-  const jpgBuf = await fs.readFile(localJpg);
-
-  await bucket.file(thumbObjectPath).save(jpgBuf, {
-    resumable: false,
-    contentType: "image/jpeg",
-  });
-
-  return `gs://${bucket.name}/${thumbObjectPath}`;
-}
-
-/* ================= Helper ================= */
-
-function sanitizeId(id) {
-  return String(id || "")
-    .replace(/[^a-zA-Z0-9_-]/g, "_")
-    .slice(0, 100);
 }
 
 function escapeHtml(str) {
