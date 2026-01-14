@@ -9,9 +9,9 @@ import { mirrorMessageToSupabase } from "./supabaseSync.js";
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
 
-/** ================= MAIN ENTRY =================
- * index.js の saveMessageDoc() 直後に呼ばれる想定
- * runAfterProcess({ messageId, firestore, bucket })
+/**
+ * MAIN ENTRY
+ * index.js の saveMessageDoc() 直後に呼ばれる
  */
 export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
@@ -23,17 +23,17 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-    // === 0) OCR（PDF/TIFF/画像）→ PDF/TIFFは1ページ目のみ + 回転角推定 ===
+    // === 0) OCR ===
     const { fullOcrText, firstPageRotation } = await runOcr(attachments);
 
-    // === 本文ソース（subject除外） ===
+    // === 本文候補プール ===
     const bodyPool = [
       data.textPlain || "",
       data.textHtml || "",
       fullOcrText || "",
     ].join(" ");
 
-    // === 1) 管理番号決定ロジック（AKSNO優先 / 7桁固定） ===
+    // === 1) 管理番号（AKSNO → 重複チェック → generate）===
     const aksCandidate = extractAksNo7(bodyPool);
     let managementNo = null;
 
@@ -43,29 +43,25 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         .where("managementNo", "==", aksCandidate)
         .limit(1)
         .get();
-
-      if (!existingSnap.empty) {
-        managementNo = aksCandidate;
-      }
+      if (!existingSnap.empty) managementNo = aksCandidate;
     }
-
     if (!managementNo) {
       managementNo = await ensureManagementNo7(firestore);
     }
 
     // === 2) 顧客特定 ===
     const head100 = String(fullOcrText || bodyPool).slice(0, 100);
-    let customer = null;
-    if (head100) customer = await detectCustomer(firestore, head100);
-    if (!customer) customer = await detectCustomer(firestore, bodyPool);
+    let customer =
+      (head100 && (await detectCustomer(firestore, head100))) ||
+      (await detectCustomer(firestore, bodyPool));
 
-    // === 2.5) メインPDF + サムネ決定（mail / fax 共通のUI用） ===
+    // === 2.5) メインPDF + サムネ（300px） ===
     let mainPdfPath = null;
     let mainPdfThumbnailPath = null;
 
     if (bucket) {
       if (isFax) {
-        // 添付PDFをそのままメイン扱い
+        // FAX → PDF添付をそのまま使用
         const pdfAttachments = (attachments || []).filter(
           (p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf")
         );
@@ -78,17 +74,16 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
               messageId,
             });
           } catch (e) {
-            console.warn("renderPdfToThumbnail failed:", e?.message || e);
+            console.warn("renderPdfToThumbnail failed:", e);
           }
         }
       } else {
-        // mail: HTML → PDF → サムネ
+        // mail → HTML → PDF → サムネ(300px)
         const htmlSource =
           data.textHtml ||
           (data.textPlain
             ? `<pre>${escapeHtml(String(data.textPlain))}</pre>`
             : null);
-
         if (htmlSource) {
           try {
             const { pdfPath, thumbnailPath } =
@@ -100,10 +95,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
             mainPdfPath = pdfPath;
             mainPdfThumbnailPath = thumbnailPath;
           } catch (e) {
-            console.warn(
-              "renderMailHtmlToPdfAndThumbnail failed:",
-              e?.message || e
-            );
+            console.warn("renderMailHtmlToPdfAndThumbnail failed:", e);
           }
         }
       }
@@ -128,25 +120,15 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       { merge: true }
     );
 
-    // === 4) Supabase にミラー（別ファイル） ===
-    // Firestore に保存した情報 + 計算結果を渡しておく
-    const dataForMirror = {
-      ...data,
-      managementNo,
-      customerId: customer?.id ?? data.customerId ?? null,
-      customerName: customer?.name ?? data.customerName ?? null,
-      ocr: {
-        ...(data.ocr || {}),
-        fullText: fullOcrText || "",
-        rotation: firstPageRotation || 0,
-      },
-      mainPdfPath,
-      mainPdfThumbnailPath,
-    };
-
+    // === 4) Supabase ミラー ===
     mirrorMessageToSupabase({
       messageId,
-      data: dataForMirror,
+      data: {
+        ...data,
+        ocr: { fullText: fullOcrText },
+        mainPdfPath,
+        mainPdfThumbnailPath,
+      },
       managementNo,
       customer,
     });
@@ -159,7 +141,8 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
   }
 }
 
-/** ================= 管理番号（7桁固定 & AKSNO抽出） ================= */
+/* ================= 管理番号 ================= */
+
 export function extractAksNo7(text = "") {
   const re = /AKSNO\s*[:：]?\s*([A-Za-z0-9]{7})/i;
   const m = text.match(re);
@@ -168,7 +151,6 @@ export function extractAksNo7(text = "") {
 
 export async function ensureManagementNo7(firestore) {
   const FIXED_DIGITS = 7;
-
   const seqRef = firestore
     .collection("system_configs")
     .doc("sequence_managementNo_global");
@@ -176,25 +158,23 @@ export async function ensureManagementNo7(firestore) {
   return await firestore.runTransaction(async (tx) => {
     const snap = await tx.get(seqRef);
     const current = snap.exists && snap.data()?.v ? Number(snap.data().v) : 0;
-    const digits = FIXED_DIGITS;
 
     let next = current + 1;
-    const max = Math.pow(16, digits);
+    const max = Math.pow(16, FIXED_DIGITS);
     if (next >= max) next = 1;
 
     tx.set(
       seqRef,
-      { v: next, digits, updatedAt: Date.now() },
+      { v: next, digits: FIXED_DIGITS, updatedAt: Date.now() },
       { merge: true }
     );
 
-    return next.toString(16).toUpperCase().padStart(digits, "0");
+    return next.toString(16).toUpperCase().padStart(FIXED_DIGITS, "0");
   });
 }
 
-/** ================ OCRユーティリティ（回転角推定つき） ================= */
+/* ================= OCR ================= */
 
-/** 2点の角度（度）0..360 */
 function angleDeg(p1 = {}, p2 = {}) {
   const dx = (p2.x ?? 0) - (p1.x ?? 0);
   const dy = (p2.y ?? 0) - (p1.y ?? 0);
@@ -204,45 +184,40 @@ function angleDeg(p1 = {}, p2 = {}) {
   return deg;
 }
 
-/** 0/90/180/270 に丸める */
 function quantizeRotation(deg) {
-  const candidates = [0, 90, 180, 270];
+  const c = [0, 90, 180, 270];
   let best = 0;
-  let bestDiff = 1e9;
-  for (const c of candidates) {
-    const d = Math.min(Math.abs(deg - c), 360 - Math.abs(deg - c));
+  let bestDiff = 99999;
+  for (const x of c) {
+    const d = Math.min(Math.abs(deg - x), 360 - Math.abs(deg - x));
     if (d < bestDiff) {
       bestDiff = d;
-      best = c;
+      best = x;
     }
   }
   return best;
 }
 
-/** ページのブロック上辺角度の多数決で回転角を推定 */
 function estimatePageRotationFromBlocks(page) {
   const votes = { 0: 0, 90: 0, 180: 0, 270: 0 };
   const blocks = page?.blocks || [];
+
   for (const b of blocks) {
     const v = b.boundingBox?.vertices || [];
     if (v.length >= 2) {
       const deg = angleDeg(v[0], v[1]);
-      const q = quantizeRotation(deg);
-      votes[q] = (votes[q] || 0) + 1;
+      votes[quantizeRotation(deg)]++;
     }
   }
-  const entries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
-  return Number(entries[0]?.[0] ?? 0);
+
+  return Number(Object.entries(votes).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0);
 }
 
-// PDF/TIFF → 1ページ目 OCR
 async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const info = parseGsUri(gcsUri);
   if (!info) return { text: "", rotation: 0 };
 
-  const tmpPrefix = `_vision_out/${Date.now()}_${Math.random()
-    .toString(36)
-    .slice(2)}/`;
+  const tmpPrefix = `_vision/${Date.now()}_${Math.random().toString(36).slice(2)}/`;
   const outUri = `gs://${info.bucket}/${tmpPrefix}`;
 
   const [op] = await client.asyncBatchAnnotateFiles({
@@ -258,9 +233,7 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
 
   await op.promise();
 
-  const [files] = await storage
-    .bucket(info.bucket)
-    .getFiles({ prefix: tmpPrefix });
+  const [files] = await storage.bucket(info.bucket).getFiles({ prefix: tmpPrefix });
   if (!files.length) return { text: "", rotation: 0 };
 
   const [buf] = await files[0].download();
@@ -269,14 +242,14 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const json = JSON.parse(buf.toString());
   const resp = json.responses?.[0];
   const text = resp?.fullTextAnnotation?.text || "";
-
   const page = resp?.fullTextAnnotation?.pages?.[0];
-  const rotation = page ? estimatePageRotationFromBlocks(page) : 0;
 
-  return { text, rotation };
+  return {
+    text,
+    rotation: page ? estimatePageRotationFromBlocks(page) : 0,
+  };
 }
 
-// 画像 OCR（documentTextDetection）
 async function ocrImageTextWithRotation(gcsUri) {
   const [res] = await client.documentTextDetection(gcsUri);
   const text =
@@ -284,11 +257,12 @@ async function ocrImageTextWithRotation(gcsUri) {
     res.textAnnotations?.[0]?.description ||
     "";
   const page = res.fullTextAnnotation?.pages?.[0];
-  const rotation = page ? estimatePageRotationFromBlocks(page) : 0;
-  return { text, rotation };
+  return {
+    text,
+    rotation: page ? estimatePageRotationFromBlocks(page) : 0,
+  };
 }
 
-// 全添付の OCR
 async function runOcr(attachments) {
   let fullOcrText = "";
   let firstPageRotation = null;
@@ -307,22 +281,23 @@ async function runOcr(attachments) {
         r = await ocrImageTextWithRotation(uri);
       }
 
-      if (!r?.text) continue;
-
-      fullOcrText += (fullOcrText ? "\n" : "") + r.text;
-
-      if (firstPageRotation == null) {
-        firstPageRotation = r.rotation ?? 0;
+      if (r?.text) {
+        fullOcrText += (fullOcrText ? "\n" : "") + r.text;
+        if (firstPageRotation == null) firstPageRotation = r.rotation;
       }
     } catch (e) {
-      console.warn("OCR failed:", uri, e?.message || e);
+      console.warn("OCR failed:", uri, e);
     }
   }
 
-  return { fullOcrText, firstPageRotation: firstPageRotation ?? 0 };
+  return {
+    fullOcrText,
+    firstPageRotation: firstPageRotation ?? 0,
+  };
 }
 
-/** ================ 顧客マスタ照合 ================= */
+/* ================= 顧客特定 ================= */
+
 async function detectCustomer(firestore, sourceText) {
   try {
     const snap = await firestore
@@ -332,17 +307,14 @@ async function detectCustomer(firestore, sourceText) {
     if (!snap.exists) return null;
 
     const arr = snap.data()?.customers || [];
-    const searchSource = (sourceText || "")
-      .replace(/\s+/g, "")
-      .toLowerCase();
+    const s = (sourceText || "").replace(/\s+/g, "").toLowerCase();
 
     for (const c of arr) {
       const aliases = (c.aliases || []).map((a) => String(a).toLowerCase());
       if (
-        aliases.some((a) => {
-          const cleanedAlias = a.replace(/\s+/g, "");
-          return cleanedAlias && searchSource.includes(cleanedAlias);
-        })
+        aliases.some((a) =>
+          s.includes(a.replace(/\s+/g, ""))
+        )
       ) {
         return { id: c.id, name: c.name };
       }
@@ -353,18 +325,16 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/** ================= GCS URI パース ================= */
+/* ================= GCS URI parse ================= */
+
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
 }
 
-/** ================= メールHTML → PDF + サムネ生成 ================= */
-async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
-  if (!bucket) {
-    throw new Error("Bucket is required for renderMailHtmlToPdfAndThumbnail");
-  }
+/* ================= HTML→PDF + 300px サムネ ================= */
 
+async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
   const safeId = sanitizeId(messageId);
   const pdfTmp = `/tmp/mail-${safeId}.pdf`;
   const jpgTmp = `/tmp/mail-${safeId}.jpg`;
@@ -372,19 +342,26 @@ async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
   const browser = await puppeteer.launch({
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
+
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
 
-    // PDF 出力
+    // PDF作成
     await page.pdf({
       path: pdfTmp,
       format: "A4",
       printBackground: true,
     });
 
-    // サムネ（画面キャプチャ）
+    // サムネ生成（幅300px）
     await page.setViewport({ width: 1024, height: 1400 });
+    const zoom = 300 / 1024;
+
+    await page.evaluate((zoom) => {
+      document.body.style.zoom = zoom;
+    }, zoom);
+
     await page.screenshot({
       path: jpgTmp,
       type: "jpeg",
@@ -395,20 +372,15 @@ async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
     await browser.close().catch(() => {});
   }
 
+  // GCS アップロード
   const pdfObjectPath = `mail_rendered/${safeId}.pdf`;
   const jpgObjectPath = `mail_thumbs/${safeId}.jpg`;
 
   const pdfBuf = await fs.readFile(pdfTmp);
   const jpgBuf = await fs.readFile(jpgTmp);
 
-  await bucket.file(pdfObjectPath).save(pdfBuf, {
-    resumable: false,
-    contentType: "application/pdf",
-  });
-  await bucket.file(jpgObjectPath).save(jpgBuf, {
-    resumable: false,
-    contentType: "image/jpeg",
-  });
+  await bucket.file(pdfObjectPath).save(pdfBuf, { resumable: false, contentType: "application/pdf" });
+  await bucket.file(jpgObjectPath).save(jpgBuf, { resumable: false, contentType: "image/jpeg" });
 
   return {
     pdfPath: `gs://${bucket.name}/${pdfObjectPath}`,
@@ -416,29 +388,35 @@ async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
   };
 }
 
-/** ================= FAX PDF → サムネ生成 ================= */
-async function renderPdfToThumbnail({ bucket, pdfGsUri, messageId }) {
-  if (!bucket) {
-    throw new Error("Bucket is required for renderPdfToThumbnail");
-  }
-  const info = parseGsUri(pdfGsUri);
-  if (!info) throw new Error("Invalid GCS URI: " + pdfGsUri);
+/* ================= PDF→300px サムネ ================= */
 
+async function renderPdfToThumbnail({ bucket, pdfGsUri, messageId }) {
+  const info = parseGsUri(pdfGsUri);
   const safeId = sanitizeId(messageId);
+
   const localPdf = `/tmp/fax-${safeId}.pdf`;
   const localJpg = `/tmp/fax-${safeId}.jpg`;
 
-  // 元PDFをダウンロード
-  const srcBucket = storage.bucket(info.bucket);
-  await srcBucket.file(info.path).download({ destination: localPdf });
+  // PDF ダウンロード
+  await storage.bucket(info.bucket).file(info.path).download({ destination: localPdf });
 
   const browser = await puppeteer.launch({
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
+
   try {
     const page = await browser.newPage();
+
     await page.goto(`file://${localPdf}`, { waitUntil: "networkidle0" });
+
+    // サムネ生成（幅300px）
     await page.setViewport({ width: 1024, height: 1400 });
+    const zoom = 300 / 1024;
+
+    await page.evaluate((zoom) => {
+      document.body.style.zoom = zoom;
+    }, zoom);
+
     await page.screenshot({
       path: localJpg,
       type: "jpeg",
@@ -460,7 +438,8 @@ async function renderPdfToThumbnail({ bucket, pdfGsUri, messageId }) {
   return `gs://${bucket.name}/${thumbObjectPath}`;
 }
 
-/** ================= ヘルパ ================= */
+/* ================= Helper ================= */
+
 function sanitizeId(id) {
   return String(id || "")
     .replace(/[^a-zA-Z0-9_-]/g, "_")
