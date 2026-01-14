@@ -23,31 +23,18 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-    // === 0) OCR（テキストだけ取得、rotation は使わない）===
+    // === 0) OCR（テキストだけ取得）===
     const { fullOcrText } = await runOcr(attachments);
 
-    // === 本文候補プール ===
+    // === 本文候補プール（顧客特定などに使用） ===
     const bodyPool = [
       data.textPlain || "",
       data.textHtml || "",
       fullOcrText || "",
     ].join(" ");
 
-    // === 1) 管理番号（AKSNO → 重複チェック → generate）===
-    const aksCandidate = extractAksNo7(bodyPool);
-    let managementNo = null;
-
-    if (aksCandidate) {
-      const existingSnap = await firestore
-        .collection("messages")
-        .where("managementNo", "==", aksCandidate)
-        .limit(1)
-        .get();
-      if (!existingSnap.empty) managementNo = aksCandidate;
-    }
-    if (!managementNo) {
-      managementNo = await ensureManagementNo7(firestore);
-    }
+    // === 1) 管理番号（毎回新規発番）===
+    const managementNo = await ensureManagementNo7(firestore);
 
     // === 2) 顧客特定 ===
     const head100 = String(fullOcrText || bodyPool).slice(0, 100);
@@ -57,33 +44,38 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
     // === 2.5) メインPDF ===
     let mainPdfPath = null;
-    let mainPdfThumbnailPath = null; // サムネは使わないが項目は残す
+    let mainPdfThumbnailPath = null; // サムネは使わないがフィールドは残す
 
     if (bucket) {
       if (isFax) {
-        // 📠 FAX：textHtml があっても絶対に HTML→PDF はしない
+        // 📠 FAX → 添付PDFをそのままメインPDFとして扱う
         const firstAttachment = (attachments || []).find(
           (p) => typeof p === "string"
         );
         if (firstAttachment) {
-          mainPdfPath = firstAttachment;  // 添付PDFをそのまま使う
+          mainPdfPath = firstAttachment;
         }
       } else {
-        // ✉ メール：HTML → PDF
+        // ✉ メール → HTML → PDF（サムネ無し）
         const htmlSource =
           data.textHtml ||
-          (data.textPlain ? `<pre>${String(data.textPlain)}</pre>` : null);
-    
+          (data.textPlain
+            ? `<pre>${String(data.textPlain)}</pre>`
+            : null);
+
         if (htmlSource) {
-          mainPdfPath = await renderMailHtmlToPdf({
-            bucket,
-            messageId,
-            html: htmlSource,
-          });
+          try {
+            mainPdfPath = await renderMailHtmlToPdf({
+              bucket,
+              messageId,
+              html: htmlSource,
+            });
+          } catch (e) {
+            console.error("renderMailHtmlToPdf failed:", e);
+          }
         }
       }
     }
-    
 
     // === 3) Firestore 更新 ===
     await msgRef.set(
@@ -125,12 +117,6 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 }
 
 /* ================= 管理番号 ================= */
-
-export function extractAksNo7(text = "") {
-  const re = /AKSNO\s*[:：]?\s*([A-Za-z0-9]{7})/i;
-  const m = text.match(re);
-  return m ? m[1].toUpperCase() : null;
-}
 
 export async function ensureManagementNo7(firestore) {
   const FIXED_DIGITS = 7;
@@ -309,4 +295,3 @@ function sanitizeId(id) {
     .replace(/[^a-zA-Z0-9_-]/g, "_")
     .slice(0, 100);
 }
-
