@@ -87,6 +87,7 @@ async function storeRefreshToken(token) {
 }
 
 async function getGmail() {
+  const tStart = Date.now();
   const refresh = await getStoredRefreshToken();
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && refresh) {
     const oAuth2 = new google.auth.OAuth2(
@@ -95,7 +96,9 @@ async function getGmail() {
       OAUTH_REDIRECT_URI
     );
     oAuth2.setCredentials({ refresh_token: refresh });
-    return google.gmail({ version: "v1", auth: oAuth2 });
+    const gmail = google.gmail({ version: "v1", auth: oAuth2 });
+    console.log("[gmail] getGmail done in", Date.now() - tStart, "ms");
+    return gmail;
   }
   throw new Error("No OAuth refresh token available.");
 }
@@ -105,27 +108,48 @@ async function saveAttachmentToGCS(userEmail, messageId, part) {
   if (!bucket) return null;
   const attachId = part?.body?.attachmentId;
   if (!attachId) return null;
+
+  const tGet = Date.now();
   const gmail = await getGmail();
   const res = await gmail.users.messages.attachments.get({
     userId: "me",
     messageId,
     id: attachId,
   });
+  console.log(
+    "[attach] gmail.users.messages.attachments.get",
+    { messageId, attachId },
+    Date.now() - tGet,
+    "ms"
+  );
+
   const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
   const bytes = Buffer.from(b64, "base64");
   const filename = safeFilename(part.filename || `attachment-${attachId}`);
   const objectPath = `gmail/${encodeURIComponent(
     userEmail
   )}/${messageId}/${filename}`;
+
+  const tSave = Date.now();
   await bucket.file(objectPath).save(bytes, {
     resumable: false,
     metadata: { contentType: part.mimeType || "application/octet-stream" },
   });
+  console.log(
+    "[attach] GCS save",
+    { objectPath },
+    Date.now() - tSave,
+    "ms"
+  );
+
   return `gs://${GCS_BUCKET}/${objectPath}`;
 }
 
 // ==== メッセージ保存 ====
 async function saveMessageDoc(emailAddress, m) {
+  const tTotal = Date.now();
+  console.log("[msg] saveMessageDoc start", m.data.id);
+
   const payload = m.data.payload;
   const headers = payload?.headers || [];
   const subject = getHeader(headers, "Subject");
@@ -147,13 +171,29 @@ async function saveMessageDoc(emailAddress, m) {
 
   const attachments = [];
   const parts = flattenParts(payload?.parts || []);
+
+  const tAttachLoop = Date.now();
   for (const p of parts) {
     if (p?.filename && p.body?.attachmentId) {
+      const tOneAttach = Date.now();
       const path = await saveAttachmentToGCS(emailAddress, m.data.id, p);
+      console.log(
+        "[msg] one attachment processed",
+        { messageId: m.data.id, filename: p.filename },
+        Date.now() - tOneAttach,
+        "ms"
+      );
       if (path) attachments.push(path);
     }
   }
+  console.log(
+    "[msg] attachments loop done",
+    { messageId: m.data.id, count: attachments.length },
+    Date.now() - tAttachLoop,
+    "ms"
+  );
 
+  const tSet = Date.now();
   await db
     .collection("messages")
     .doc(m.data.id)
@@ -179,9 +219,28 @@ async function saveMessageDoc(emailAddress, m) {
       },
       { merge: true }
     );
+  console.log(
+    "[msg] firestore messages.set",
+    m.data.id,
+    Date.now() - tSet,
+    "ms"
+  );
 
-  // ✅ ここで後処理呼び出し
+  const tAfter = Date.now();
   await runAfterProcess({ messageId: m.data.id, firestore: db, bucket });
+  console.log(
+    "[msg] runAfterProcess",
+    m.data.id,
+    Date.now() - tAfter,
+    "ms"
+  );
+
+  console.log(
+    "[msg] saveMessageDoc total",
+    m.data.id,
+    Date.now() - tTotal,
+    "ms"
+  );
 }
 
 // ==== ルーティング ====
@@ -203,6 +262,7 @@ app.get("/oauth2/start", async (_req, res) => {
     });
     res.redirect(url);
   } catch (e) {
+    console.error("/oauth2/start error:", e);
     res.status(500).send("oauth start error");
   }
 });
@@ -222,15 +282,24 @@ app.get("/oauth2/callback", async (req, res) => {
     if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
     res.status(200).send("linked");
   } catch (e) {
+    console.error("/oauth2/callback error:", e);
     res.status(500).send("oauth callback error");
   }
 });
 
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
+  console.log("[poll] start");
+
   try {
+    const tGmail = Date.now();
     const gmail = await getGmail();
+    console.log("[poll] getGmail", Date.now() - tGmail, "ms");
+
+    const tProfile = Date.now();
     const profile = await gmail.users.getProfile({ userId: "me" });
+    console.log("[poll] getProfile", Date.now() - tProfile, "ms");
+
     const emailAddress = profile.data.emailAddress || "me";
     const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
     const minutes =
@@ -246,31 +315,74 @@ app.post("/gmail/poll", async (req, res) => {
     let seen = 0;
 
     do {
+      const tList = Date.now();
       const list = await gmail.users.messages.list({
         userId: "me",
         q,
         pageToken,
         maxResults: 200,
       });
+      console.log("[poll] messages.list", Date.now() - tList, "ms");
+
       pageToken = list.data.nextPageToken || null;
       const ids = (list.data.messages || []).map((m) => m.id);
       if (!ids.length) break;
 
       for (const id of ids) {
+        const tOne = Date.now();
         seen++;
         const doc = await db.collection("messages").doc(id).get();
-        if (doc.exists) continue;
+        if (doc.exists) {
+          console.log(
+            "[poll] message already exists, skip",
+            id,
+            "in",
+            Date.now() - tOne,
+            "ms"
+          );
+          continue;
+        }
+
+        const tGetMsg = Date.now();
         const full = await gmail.users.messages.get({
           userId: "me",
           id,
           format: "full",
         });
+        console.log(
+          "[poll] messages.get",
+          id,
+          Date.now() - tGetMsg,
+          "ms"
+        );
+
+        const tSave = Date.now();
         await saveMessageDoc(emailAddress, full);
+        console.log(
+          "[poll] saveMessageDoc",
+          id,
+          Date.now() - tSave,
+          "ms"
+        );
+
+        console.log(
+          "[poll] one message total",
+          id,
+          Date.now() - tOne,
+          "ms"
+        );
         newCount++;
       }
     } while (pageToken);
 
     const ms = Date.now() - started;
+    console.log(
+      "[poll] done",
+      { seen, newCount, minutes },
+      "in",
+      ms,
+      "ms"
+    );
     res
       .status(200)
       .send(`OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`);
