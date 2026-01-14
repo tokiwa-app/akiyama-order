@@ -240,30 +240,53 @@ async function runOcr(attachments) {
 }
 
 /* ================= 顧客特定 ================= */
+/* ================= 顧客特定 ================= */
 
 async function detectCustomer(_firestore, sourceText) {
   try {
-    // akiyama-system / jsons / Client Search
     const snap = await customerDb
       .collection("jsons")
       .doc("Client Search")
       .get();
 
     console.log("Client Search exists?", snap.exists);
-
     if (!snap.exists) return null;
 
-    const root = snap.data();              // ← ここに { type, tables } が入っている前提
-    const tables = root.tables;
+    const root = snap.data(); // ← ここに今貼ってくれた JSON がどこかに入ってる
+    console.log("Client Search root keys:", Object.keys(root || {}));
 
-    if (!Array.isArray(tables) || !tables[0]?.matrix) {
-      console.log("Client Search: tables[0].matrix not found");
+    // --- tables[0].matrix を持つノードを再帰的に探す ---
+    function findSheetNode(node) {
+      if (!node || typeof node !== "object") return null;
+
+      // この node 自体が { tables: [ { matrix: [...] } ] } を持っているか？
+      if (
+        Array.isArray(node.tables) &&
+        node.tables[0] &&
+        Array.isArray(node.tables[0].matrix)
+      ) {
+        return node;
+      }
+
+      // 子ノードも順番に探す
+      for (const v of Object.values(node)) {
+        if (v && typeof v === "object") {
+          const found = findSheetNode(v);
+          if (found) return found;
+        }
+      }
       return null;
     }
 
-    const matrix = tables[0].matrix;
+    const sheetNode = findSheetNode(root);
+    if (!sheetNode) {
+      console.log("NO sheet node with tables[0].matrix found in Client Search");
+      return null;
+    }
+
+    const matrix = sheetNode.tables[0].matrix;
     if (!Array.isArray(matrix) || matrix.length < 2) {
-      console.log("Client Search: matrix has no data rows");
+      console.log("matrix empty or no data rows");
       return null;
     }
 
@@ -277,6 +300,7 @@ async function detectCustomer(_firestore, sourceText) {
     const colMailAliases = idx("mail_aliases");
     const colFaxAliases  = idx("fax_aliases");
     const colNameAliases = idx("name_aliases");
+    // kana は使わないので無視してOK（あっても邪魔しない）
 
     console.log("col indexes:", {
       colId,
@@ -302,7 +326,7 @@ async function detectCustomer(_firestore, sourceText) {
 
     const split = (v) =>
       String(v || "")
-        .split(/[,\s、;／]+/)   // カンマ・スペース・読点などで分割
+        .split(/[,\s、;／]+/)
         .map((x) => x.trim())
         .filter(Boolean);
 
@@ -312,8 +336,8 @@ async function detectCustomer(_firestore, sourceText) {
 
       const mailAliases =
         colMailAliases !== -1 ? split(row[colMailAliases]) : [];
-      const faxAliases =
-        colFaxAliases !== -1 ? split(row[colFaxAliases]) : [];
+      const faxAliases  =
+        colFaxAliases  !== -1 ? split(row[colFaxAliases])  : [];
       const nameAliases =
         colNameAliases !== -1 ? split(row[colNameAliases]) : [];
 
