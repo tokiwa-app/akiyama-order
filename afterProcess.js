@@ -23,8 +23,13 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-    // === 0) OCR（テキストだけ取得）===
-    const { fullOcrText } = await runOcr(attachments);
+     // === 0) OCR（テキストだけ取得）===
+    let fullOcrText = "";
+    if (isFax) {
+      const r = await runOcr(attachments);
+      fullOcrText = r.fullOcrText || "";
+    }
+
 
     // === 本文候補プール（顧客特定などに使用） ===
     const bodyPool = [
