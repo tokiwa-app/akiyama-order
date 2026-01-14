@@ -61,34 +61,29 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
     if (bucket) {
       if (isFax) {
-        // FAX → 添付のうち最初の1つをメインPDFとして扱う
+        // 📠 FAX：textHtml があっても絶対に HTML→PDF はしない
         const firstAttachment = (attachments || []).find(
           (p) => typeof p === "string"
         );
         if (firstAttachment) {
-          mainPdfPath = firstAttachment;
+          mainPdfPath = firstAttachment;  // 添付PDFをそのまま使う
         }
       } else {
-        // mail → HTML → PDF（サムネ無し）
+        // ✉ メール：HTML → PDF
         const htmlSource =
           data.textHtml ||
-          (data.textPlain
-            ? `<pre>${escapeHtml(String(data.textPlain))}</pre>`
-            : null);
-
+          (data.textPlain ? `<pre>${String(data.textPlain)}</pre>` : null);
+    
         if (htmlSource) {
-          try {
-            mainPdfPath = await renderMailHtmlToPdf({
-              bucket,
-              messageId,
-              html: htmlSource,
-            });
-          } catch (e) {
-            console.error("renderMailHtmlToPdf failed:", e);
-          }
+          mainPdfPath = await renderMailHtmlToPdf({
+            bucket,
+            messageId,
+            html: htmlSource,
+          });
         }
       }
     }
+    
 
     // === 3) Firestore 更新 ===
     await msgRef.set(
