@@ -243,30 +243,67 @@ async function runOcr(attachments) {
 
 async function detectCustomer(_firestore, sourceText) {
   try {
-    // ★ akiyama-system / jsons / Client Search の JSON を読む
+    // どんなテキストで検索しているか、先頭だけログに出す
+    console.log("detectCustomer sourceText head:", String(sourceText).slice(0, 200));
+
     const snap = await customerDb
       .collection("jsons")
       .doc("Client Search")
       .get();
+
+    console.log("Client Search exists?", snap.exists);
+
     if (!snap.exists) return null;
 
-    const data = snap.data();
-    if (!Array.isArray(data.tables) || !data.tables[0]?.matrix) return null;
+    const raw = snap.data();
+    console.log("Client Search root keys:", Object.keys(raw || {}));
+
+    // ① ルート直下に tables があるパターン
+    // ② 何かの下にネストされているパターン（例: { data: { tables: [...] } }）
+    let data = raw;
+    if (!Array.isArray(data.tables)) {
+      // よくあるラップフィールド名を順に試す（必要なら増やせる）
+      if (raw.data && Array.isArray(raw.data.tables)) {
+        data = raw.data;
+      } else if (raw.sheet && Array.isArray(raw.sheet.tables)) {
+        data = raw.sheet;
+      }
+    }
+
+    if (!Array.isArray(data.tables) || !data.tables[0]?.matrix) {
+      console.log("NO tables[0].matrix found in Client Search");
+      return null;
+    }
 
     const matrix = data.tables[0].matrix;
-    if (!matrix || matrix.length < 2) return null;
+    if (!matrix || matrix.length < 2) {
+      console.log("matrix empty or no data rows");
+      return null;
+    }
 
     const header = matrix[0];
+    console.log("Client Search header row:", header);
+
     const idx = (colName) => header.indexOf(colName);
 
     const colId          = idx("id");
     const colName        = idx("name");
-    const colKana        = idx("kana");
     const colMailAliases = idx("mail_aliases");
     const colFaxAliases  = idx("fax_aliases");
     const colNameAliases = idx("name_aliases");
 
-    if (colId === -1 || colName === -1) return null;
+    console.log("col indexes:", {
+      colId,
+      colName,
+      colMailAliases,
+      colFaxAliases,
+      colNameAliases,
+    });
+
+    if (colId === -1 || colName === -1) {
+      console.log("id or name column not found");
+      return null;
+    }
 
     const normalize = (str) =>
       String(str || "").toLowerCase().replace(/\s+/g, "");
@@ -287,9 +324,9 @@ async function detectCustomer(_firestore, sourceText) {
       const id   = row[colId];
       const name = row[colName];
 
-      const mailAliases = split(row[colMailAliases]);
-      const faxAliases  = split(row[colFaxAliases]);
-      const nameAliases = split(row[colNameAliases]);
+      const mailAliases = colMailAliases !== -1 ? split(row[colMailAliases]) : [];
+      const faxAliases  = colFaxAliases  !== -1 ? split(row[colFaxAliases])  : [];
+      const nameAliases = colNameAliases !== -1 ? split(row[colNameAliases]) : [];
 
       return { id, name, mailAliases, faxAliases, nameAliases };
     });
@@ -299,6 +336,7 @@ async function detectCustomer(_firestore, sourceText) {
       for (const a of r.mailAliases) {
         const aNorm = normalize(a);
         if (aNorm && textNorm.includes(aNorm)) {
+          console.log("match by MAIL alias:", { id: r.id, name: r.name, alias: a });
           return { id: r.id, name: r.name };
         }
       }
@@ -309,6 +347,7 @@ async function detectCustomer(_firestore, sourceText) {
       for (const a of r.faxAliases) {
         const aDigits = normalizeDigits(a);
         if (aDigits && textDigits.includes(aDigits)) {
+          console.log("match by FAX alias:", { id: r.id, name: r.name, alias: a, aDigits, textDigits });
           return { id: r.id, name: r.name };
         }
       }
@@ -319,17 +358,20 @@ async function detectCustomer(_firestore, sourceText) {
       for (const a of r.nameAliases) {
         const aNorm = normalize(a);
         if (aNorm && textNorm.includes(aNorm)) {
+          console.log("match by NAME alias:", { id: r.id, name: r.name, alias: a });
           return { id: r.id, name: r.name };
         }
       }
     }
 
+    console.log("no customer matched");
 
   } catch (e) {
     console.error("detectCustomer error:", e);
   }
   return null;
 }
+
 
 /* ================= HTML → PDF（メール用） ================= */
 
