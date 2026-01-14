@@ -63,27 +63,29 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
     if (bucket) {
       if (isFax) {
-        // FAX → PDF添付をそのまま使用
-        const pdfAttachments = (attachments || []).filter(
-          (p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf")
+        // FAX → 添付のうち最初の1つをメインPDFとして扱う
+        const firstAttachment = (attachments || []).find(
+          (p) => typeof p === "string"
         );
-        if (pdfAttachments.length > 0) {
-          mainPdfPath = pdfAttachments[0];
+      
+        if (firstAttachment) {
+          mainPdfPath = firstAttachment;
           try {
             mainPdfThumbnailPath = await renderPdfToThumbnail({
               bucket,
-              pdfGsUri: pdfAttachments[0],
+              pdfGsUri: firstAttachment,
               messageId,
             });
           } catch (e) {
             console.error("renderPdfToThumbnail failed:", {
-              pdf: pdfAttachments[0],
+              pdf: firstAttachment,
               messageId,
               error: e,
             });
           }
         }
-      } else {
+      }
+ else {
         // mail → HTML → PDF → サムネ(300px)
         const htmlSource =
           data.textHtml ||
