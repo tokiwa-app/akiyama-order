@@ -240,7 +240,6 @@ async function runOcr(attachments) {
 }
 
 /* ================= 顧客特定 ================= */
-/* ================= 顧客特定 ================= */
 
 async function detectCustomer(_firestore, sourceText) {
   try {
@@ -252,41 +251,37 @@ async function detectCustomer(_firestore, sourceText) {
     console.log("Client Search exists?", snap.exists);
     if (!snap.exists) return null;
 
-    const root = snap.data(); // ← ここに今貼ってくれた JSON がどこかに入ってる
-    console.log("Client Search root keys:", Object.keys(root || {}));
+    const doc = snap.data(); // { main: "...." } の形
+    console.log("Client Search root keys:", Object.keys(doc || {}));
 
-    // --- tables[0].matrix を持つノードを再帰的に探す ---
-    function findSheetNode(node) {
-      if (!node || typeof node !== "object") return null;
-
-      // この node 自体が { tables: [ { matrix: [...] } ] } を持っているか？
-      if (
-        Array.isArray(node.tables) &&
-        node.tables[0] &&
-        Array.isArray(node.tables[0].matrix)
-      ) {
-        return node;
+    // ★ main は string 型（JSON文字列）なので parse する
+    let sheet = doc.main;
+    if (typeof sheet === "string") {
+      try {
+        sheet = JSON.parse(sheet);
+      } catch (e) {
+        console.error("JSON.parse(doc.main) failed:", e);
+        return null;
       }
+    }
 
-      // 子ノードも順番に探す
-      for (const v of Object.values(node)) {
-        if (v && typeof v === "object") {
-          const found = findSheetNode(v);
-          if (found) return found;
-        }
-      }
+    // ここから先は、君がくれた JSON そのものを前提にする
+    // sheet = { type: "sheet", tables: [ { ..., matrix: [...] } ] }
+
+    if (!sheet || typeof sheet !== "object") {
+      console.log("Client Search: main is not object after parse:", sheet);
       return null;
     }
 
-    const sheetNode = findSheetNode(root);
-    if (!sheetNode) {
-      console.log("NO sheet node with tables[0].matrix found in Client Search");
+    const tables = sheet.tables;
+    if (!Array.isArray(tables) || !tables[0] || !Array.isArray(tables[0].matrix)) {
+      console.log("Client Search: tables[0].matrix not found in parsed main");
       return null;
     }
 
-    const matrix = sheetNode.tables[0].matrix;
+    const matrix = tables[0].matrix;
     if (!Array.isArray(matrix) || matrix.length < 2) {
-      console.log("matrix empty or no data rows");
+      console.log("Client Search: matrix has no data rows");
       return null;
     }
 
@@ -300,7 +295,7 @@ async function detectCustomer(_firestore, sourceText) {
     const colMailAliases = idx("mail_aliases");
     const colFaxAliases  = idx("fax_aliases");
     const colNameAliases = idx("name_aliases");
-    // kana は使わないので無視してOK（あっても邪魔しない）
+    // kana は使わないので無視
 
     console.log("col indexes:", {
       colId,
@@ -389,7 +384,6 @@ async function detectCustomer(_firestore, sourceText) {
   }
   return null;
 }
-
 
 /* ================= HTML → PDF（メール用） ================= */
 
