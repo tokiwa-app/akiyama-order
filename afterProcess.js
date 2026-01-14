@@ -1,6 +1,8 @@
 // afterProcess.js
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
+import fs from "fs/promises";
+import puppeteer from "puppeteer";
 import { mirrorMessageToSupabase } from "./supabaseSync.js";
 
 // ====== Vision / Storage clients ======
@@ -21,7 +23,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-    // === 0) OCR（テキストだけ取得、rotation は廃止）===
+    // === 0) OCR（テキストだけ取得、rotation は使わない）===
     const { fullOcrText } = await runOcr(attachments);
 
     // === 本文候補プール ===
@@ -53,17 +55,38 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       (head100 && (await detectCustomer(firestore, head100))) ||
       (await detectCustomer(firestore, bodyPool));
 
-    // === 2.5) メインPDF（サムネは一旦なし） ===
+    // === 2.5) メインPDF ===
     let mainPdfPath = null;
-    let mainPdfThumbnailPath = null;
+    let mainPdfThumbnailPath = null; // サムネは使わないが項目は残す
 
-    // FAX のときだけ、メインPDFとして「最初の添付」を覚えておく
-    if (bucket && isFax) {
-      const firstAttachment = (attachments || []).find(
-        (p) => typeof p === "string"
-      );
-      if (firstAttachment) {
-        mainPdfPath = firstAttachment;
+    if (bucket) {
+      if (isFax) {
+        // FAX → 添付のうち最初の1つをメインPDFとして扱う
+        const firstAttachment = (attachments || []).find(
+          (p) => typeof p === "string"
+        );
+        if (firstAttachment) {
+          mainPdfPath = firstAttachment;
+        }
+      } else {
+        // mail → HTML → PDF（サムネ無し）
+        const htmlSource =
+          data.textHtml ||
+          (data.textPlain
+            ? `<pre>${escapeHtml(String(data.textPlain))}</pre>`
+            : null);
+
+        if (htmlSource) {
+          try {
+            mainPdfPath = await renderMailHtmlToPdf({
+              bucket,
+              messageId,
+              html: htmlSource,
+            });
+          } catch (e) {
+            console.error("renderMailHtmlToPdf failed:", e);
+          }
+        }
       }
     }
 
@@ -245,9 +268,50 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/* ================= GCS URI parse ================= */
+/* ================= HTML → PDF（メール用） ================= */
+
+async function renderMailHtmlToPdf({ bucket, messageId, html }) {
+  const safeId = sanitizeId(messageId);
+  const pdfTmp = `/tmp/mail-${safeId}.pdf`;
+
+  const browser = await puppeteer.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
+
+    await page.pdf({
+      path: pdfTmp,
+      format: "A4",
+      printBackground: true,
+    });
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  const objectPath = `mail_rendered/${safeId}.pdf`;
+  const buf = await fs.readFile(pdfTmp);
+
+  await bucket.file(objectPath).save(buf, {
+    resumable: false,
+    contentType: "application/pdf",
+  });
+
+  return `gs://${bucket.name}/${objectPath}`;
+}
+
+/* ================= Helper ================= */
 
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
 }
+
+function sanitizeId(id) {
+  return String(id || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 100);
+}
+
