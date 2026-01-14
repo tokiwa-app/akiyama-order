@@ -243,9 +243,7 @@ async function runOcr(attachments) {
 
 async function detectCustomer(_firestore, sourceText) {
   try {
-    // どんなテキストで検索しているか、先頭だけログに出す
-    console.log("detectCustomer sourceText head:", String(sourceText).slice(0, 200));
-
+    // akiyama-system / jsons / Client Search
     const snap = await customerDb
       .collection("jsons")
       .doc("Client Search")
@@ -255,34 +253,22 @@ async function detectCustomer(_firestore, sourceText) {
 
     if (!snap.exists) return null;
 
-    const raw = snap.data();
-    console.log("Client Search root keys:", Object.keys(raw || {}));
+    const root = snap.data();              // ← ここに { type, tables } が入っている前提
+    const tables = root.tables;
 
-    // ① ルート直下に tables があるパターン
-    // ② 何かの下にネストされているパターン（例: { data: { tables: [...] } }）
-    let data = raw;
-    if (!Array.isArray(data.tables)) {
-      // よくあるラップフィールド名を順に試す（必要なら増やせる）
-      if (raw.data && Array.isArray(raw.data.tables)) {
-        data = raw.data;
-      } else if (raw.sheet && Array.isArray(raw.sheet.tables)) {
-        data = raw.sheet;
-      }
-    }
-
-    if (!Array.isArray(data.tables) || !data.tables[0]?.matrix) {
-      console.log("NO tables[0].matrix found in Client Search");
+    if (!Array.isArray(tables) || !tables[0]?.matrix) {
+      console.log("Client Search: tables[0].matrix not found");
       return null;
     }
 
-    const matrix = data.tables[0].matrix;
-    if (!matrix || matrix.length < 2) {
-      console.log("matrix empty or no data rows");
+    const matrix = tables[0].matrix;
+    if (!Array.isArray(matrix) || matrix.length < 2) {
+      console.log("Client Search: matrix has no data rows");
       return null;
     }
 
     const header = matrix[0];
-    console.log("Client Search header row:", header);
+    console.log("Client Search header:", header);
 
     const idx = (colName) => header.indexOf(colName);
 
@@ -301,7 +287,7 @@ async function detectCustomer(_firestore, sourceText) {
     });
 
     if (colId === -1 || colName === -1) {
-      console.log("id or name column not found");
+      console.log("id or name column not found in header");
       return null;
     }
 
@@ -316,7 +302,7 @@ async function detectCustomer(_firestore, sourceText) {
 
     const split = (v) =>
       String(v || "")
-        .split(/[,\s、;／]+/)
+        .split(/[,\s、;／]+/)   // カンマ・スペース・読点などで分割
         .map((x) => x.trim())
         .filter(Boolean);
 
@@ -324,9 +310,12 @@ async function detectCustomer(_firestore, sourceText) {
       const id   = row[colId];
       const name = row[colName];
 
-      const mailAliases = colMailAliases !== -1 ? split(row[colMailAliases]) : [];
-      const faxAliases  = colFaxAliases  !== -1 ? split(row[colFaxAliases])  : [];
-      const nameAliases = colNameAliases !== -1 ? split(row[colNameAliases]) : [];
+      const mailAliases =
+        colMailAliases !== -1 ? split(row[colMailAliases]) : [];
+      const faxAliases =
+        colFaxAliases !== -1 ? split(row[colFaxAliases]) : [];
+      const nameAliases =
+        colNameAliases !== -1 ? split(row[colNameAliases]) : [];
 
       return { id, name, mailAliases, faxAliases, nameAliases };
     });
@@ -347,7 +336,13 @@ async function detectCustomer(_firestore, sourceText) {
       for (const a of r.faxAliases) {
         const aDigits = normalizeDigits(a);
         if (aDigits && textDigits.includes(aDigits)) {
-          console.log("match by FAX alias:", { id: r.id, name: r.name, alias: a, aDigits, textDigits });
+          console.log("match by FAX alias:", {
+            id: r.id,
+            name: r.name,
+            alias: a,
+            aDigits,
+            textDigits: textDigits.slice(0, 50),
+          });
           return { id: r.id, name: r.name };
         }
       }
@@ -364,8 +359,7 @@ async function detectCustomer(_firestore, sourceText) {
       }
     }
 
-    console.log("no customer matched");
-
+    console.log("no customer matched for text head:", textNorm.slice(0, 100));
   } catch (e) {
     console.error("detectCustomer error:", e);
   }
