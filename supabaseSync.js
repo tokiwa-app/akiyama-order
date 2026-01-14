@@ -175,22 +175,22 @@ export async function mirrorMessageToSupabase({
     }
 
     // ======================================================
-    // 3) message_attachments: 雑多な添付（全部）
+    // 3) message_attachments: 雑多な添付（mail のみ）
     // ======================================================
-    if (attachments.length > 0) {
+    if (!isFax && attachments.length > 0) {
       const rows = attachments.map((path) => ({
         case_id: caseId,
         message_id: messageId,
         gcs_path: path,
         file_name:
           typeof path === "string" ? path.split("/").pop() || null : null,
-        mime_type: null, // 必要になったら GCS から取る or Firestoreに持たせる
+        mime_type: null,
       }));
-
+    
       const { error: attErr } = await supabase
         .from("message_attachments")
         .insert(rows);
-
+    
       if (attErr) {
         console.error(
           "Supabase insert message_attachments error:",
@@ -198,6 +198,7 @@ export async function mirrorMessageToSupabase({
         );
       }
     }
+
 
     // ======================================================
     // 4) message_main_pdf_files: メインPDF（mail & fax 共通）
