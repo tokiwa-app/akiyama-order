@@ -1,5 +1,8 @@
+// afterProcess.js
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
+import puppeteer from "puppeteer";
+import fs from "fs/promises";
 import { mirrorMessageToSupabase } from "./supabaseSync.js";
 
 // ====== Vision / Storage clients ======
@@ -8,8 +11,9 @@ const storage = new Storage();
 
 /** ================= MAIN ENTRY =================
  * index.js の saveMessageDoc() 直後に呼ばれる想定
+ * runAfterProcess({ messageId, firestore, bucket })
  */
-export async function runAfterProcess({ messageId, firestore }) {
+export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
     const msgRef = firestore.collection("messages").doc(messageId);
     const msgSnap = await msgRef.get();
@@ -17,6 +21,7 @@ export async function runAfterProcess({ messageId, firestore }) {
 
     const data = msgSnap.data();
     const attachments = data.attachments || [];
+    const isFax = data.messageType === "fax";
 
     // === 0) OCR（PDF/TIFF/画像）→ PDF/TIFFは1ページ目のみ + 回転角推定 ===
     const { fullOcrText, firstPageRotation } = await runOcr(attachments);
@@ -54,6 +59,56 @@ export async function runAfterProcess({ messageId, firestore }) {
     if (head100) customer = await detectCustomer(firestore, head100);
     if (!customer) customer = await detectCustomer(firestore, bodyPool);
 
+    // === 2.5) メインPDF + サムネ決定（mail / fax 共通のUI用） ===
+    let mainPdfPath = null;
+    let mainPdfThumbnailPath = null;
+
+    if (bucket) {
+      if (isFax) {
+        // 添付PDFをそのままメイン扱い
+        const pdfAttachments = (attachments || []).filter(
+          (p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf")
+        );
+        if (pdfAttachments.length > 0) {
+          mainPdfPath = pdfAttachments[0];
+          try {
+            mainPdfThumbnailPath = await renderPdfToThumbnail({
+              bucket,
+              pdfGsUri: pdfAttachments[0],
+              messageId,
+            });
+          } catch (e) {
+            console.warn("renderPdfToThumbnail failed:", e?.message || e);
+          }
+        }
+      } else {
+        // mail: HTML → PDF → サムネ
+        const htmlSource =
+          data.textHtml ||
+          (data.textPlain
+            ? `<pre>${escapeHtml(String(data.textPlain))}</pre>`
+            : null);
+
+        if (htmlSource) {
+          try {
+            const { pdfPath, thumbnailPath } =
+              await renderMailHtmlToPdfAndThumbnail({
+                bucket,
+                messageId,
+                html: htmlSource,
+              });
+            mainPdfPath = pdfPath;
+            mainPdfThumbnailPath = thumbnailPath;
+          } catch (e) {
+            console.warn(
+              "renderMailHtmlToPdfAndThumbnail failed:",
+              e?.message || e
+            );
+          }
+        }
+      }
+    }
+
     // === 3) Firestore 更新 ===
     await msgRef.set(
       {
@@ -66,17 +121,32 @@ export async function runAfterProcess({ messageId, firestore }) {
           rotation: firstPageRotation || 0,
           at: Date.now(),
         },
+        mainPdfPath: mainPdfPath || null,
+        mainPdfThumbnailPath: mainPdfThumbnailPath || null,
         processedAt: Date.now(),
       },
       { merge: true }
     );
 
     // === 4) Supabase にミラー（別ファイル） ===
-    // Firestore が成功したあとに呼ぶので、本処理を壊さない
-    // 確実に待ちたいなら await をつける、非同期で投げっぱなしならそのまま
+    // Firestore に保存した情報 + 計算結果を渡しておく
+    const dataForMirror = {
+      ...data,
+      managementNo,
+      customerId: customer?.id ?? data.customerId ?? null,
+      customerName: customer?.name ?? data.customerName ?? null,
+      ocr: {
+        ...(data.ocr || {}),
+        fullText: fullOcrText || "",
+        rotation: firstPageRotation || 0,
+      },
+      mainPdfPath,
+      mainPdfThumbnailPath,
+    };
+
     mirrorMessageToSupabase({
       messageId,
-      data,
+      data: dataForMirror,
       managementNo,
       customer,
     });
@@ -194,7 +264,6 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   if (!files.length) return { text: "", rotation: 0 };
 
   const [buf] = await files[0].download();
-
   await Promise.all(files.map((f) => f.delete().catch(() => {})));
 
   const json = JSON.parse(buf.toString());
@@ -288,4 +357,121 @@ async function detectCustomer(firestore, sourceText) {
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
+}
+
+/** ================= メールHTML → PDF + サムネ生成 ================= */
+async function renderMailHtmlToPdfAndThumbnail({ bucket, messageId, html }) {
+  if (!bucket) {
+    throw new Error("Bucket is required for renderMailHtmlToPdfAndThumbnail");
+  }
+
+  const safeId = sanitizeId(messageId);
+  const pdfTmp = `/tmp/mail-${safeId}.pdf`;
+  const jpgTmp = `/tmp/mail-${safeId}.jpg`;
+
+  const browser = await puppeteer.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
+
+    // PDF 出力
+    await page.pdf({
+      path: pdfTmp,
+      format: "A4",
+      printBackground: true,
+    });
+
+    // サムネ（画面キャプチャ）
+    await page.setViewport({ width: 1024, height: 1400 });
+    await page.screenshot({
+      path: jpgTmp,
+      type: "jpeg",
+      quality: 80,
+      fullPage: true,
+    });
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  const pdfObjectPath = `mail_rendered/${safeId}.pdf`;
+  const jpgObjectPath = `mail_thumbs/${safeId}.jpg`;
+
+  const pdfBuf = await fs.readFile(pdfTmp);
+  const jpgBuf = await fs.readFile(jpgTmp);
+
+  await bucket.file(pdfObjectPath).save(pdfBuf, {
+    resumable: false,
+    contentType: "application/pdf",
+  });
+  await bucket.file(jpgObjectPath).save(jpgBuf, {
+    resumable: false,
+    contentType: "image/jpeg",
+  });
+
+  return {
+    pdfPath: `gs://${bucket.name}/${pdfObjectPath}`,
+    thumbnailPath: `gs://${bucket.name}/${jpgObjectPath}`,
+  };
+}
+
+/** ================= FAX PDF → サムネ生成 ================= */
+async function renderPdfToThumbnail({ bucket, pdfGsUri, messageId }) {
+  if (!bucket) {
+    throw new Error("Bucket is required for renderPdfToThumbnail");
+  }
+  const info = parseGsUri(pdfGsUri);
+  if (!info) throw new Error("Invalid GCS URI: " + pdfGsUri);
+
+  const safeId = sanitizeId(messageId);
+  const localPdf = `/tmp/fax-${safeId}.pdf`;
+  const localJpg = `/tmp/fax-${safeId}.jpg`;
+
+  // 元PDFをダウンロード
+  const srcBucket = storage.bucket(info.bucket);
+  await srcBucket.file(info.path).download({ destination: localPdf });
+
+  const browser = await puppeteer.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.goto(`file://${localPdf}`, { waitUntil: "networkidle0" });
+    await page.setViewport({ width: 1024, height: 1400 });
+    await page.screenshot({
+      path: localJpg,
+      type: "jpeg",
+      quality: 80,
+      fullPage: true,
+    });
+  } finally {
+    await browser.close().catch(() => {});
+  }
+
+  const thumbObjectPath = `fax_thumbs/${safeId}.jpg`;
+  const jpgBuf = await fs.readFile(localJpg);
+
+  await bucket.file(thumbObjectPath).save(jpgBuf, {
+    resumable: false,
+    contentType: "image/jpeg",
+  });
+
+  return `gs://${bucket.name}/${thumbObjectPath}`;
+}
+
+/** ================= ヘルパ ================= */
+function sanitizeId(id) {
+  return String(id || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 100);
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
