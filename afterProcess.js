@@ -2,10 +2,6 @@
 import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 import { mirrorMessageToSupabase } from "./supabaseSync.js";
-import {
-  renderMailHtmlToPdfAndThumbnail,
-  renderPdfToThumbnail,
-} from "./pdfUtil.js";
 
 // ====== Vision / Storage clients ======
 const client = new vision.ImageAnnotatorClient();
@@ -25,8 +21,8 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-    // === 0) OCR ===
-    const { fullOcrText, firstPageRotation } = await runOcr(attachments);
+    // === 0) OCR（テキストだけ取得、rotation は廃止）===
+    const { fullOcrText } = await runOcr(attachments);
 
     // === 本文候補プール ===
     const bodyPool = [
@@ -57,55 +53,17 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       (head100 && (await detectCustomer(firestore, head100))) ||
       (await detectCustomer(firestore, bodyPool));
 
-    // === 2.5) メインPDF + サムネ（300px） ===
+    // === 2.5) メインPDF（サムネは一旦なし） ===
     let mainPdfPath = null;
     let mainPdfThumbnailPath = null;
 
-    if (bucket) {
-      if (isFax) {
-        // FAX → 添付のうち最初の1つをメインPDFとして扱う
-        const firstAttachment = (attachments || []).find(
-          (p) => typeof p === "string"
-        );
-      
-        if (firstAttachment) {
-          mainPdfPath = firstAttachment;
-          try {
-            mainPdfThumbnailPath = await renderPdfToThumbnail({
-              bucket,
-              pdfGsUri: firstAttachment,
-              messageId,
-            });
-          } catch (e) {
-            console.error("renderPdfToThumbnail failed:", {
-              pdf: firstAttachment,
-              messageId,
-              error: e,
-            });
-          }
-        }
-      }
- else {
-        // mail → HTML → PDF → サムネ(300px)
-        const htmlSource =
-          data.textHtml ||
-          (data.textPlain
-            ? `<pre>${escapeHtml(String(data.textPlain))}</pre>`
-            : null);
-        if (htmlSource) {
-          try {
-            const { pdfPath, thumbnailPath } =
-              await renderMailHtmlToPdfAndThumbnail({
-                bucket,
-                messageId,
-                html: htmlSource,
-              });
-            mainPdfPath = pdfPath;
-            mainPdfThumbnailPath = thumbnailPath;
-          } catch (e) {
-            console.warn("renderMailHtmlToPdfAndThumbnail failed:", e);
-          }
-        }
+    // FAX のときだけ、メインPDFとして「最初の添付」を覚えておく
+    if (bucket && isFax) {
+      const firstAttachment = (attachments || []).find(
+        (p) => typeof p === "string"
+      );
+      if (firstAttachment) {
+        mainPdfPath = firstAttachment;
       }
     }
 
@@ -118,7 +76,6 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
         customerName: customer?.name || null,
         ocr: {
           fullText: fullOcrText || "",
-          rotation: firstPageRotation || 0,
           at: Date.now(),
         },
         mainPdfPath: mainPdfPath || null,
@@ -142,7 +99,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     });
 
     console.log(
-      `✅ afterProcess done id=${messageId} mgmt=${managementNo} rot=${firstPageRotation}`
+      `✅ afterProcess done id=${messageId} mgmt=${managementNo}`
     );
   } catch (e) {
     console.error("afterProcess error:", e);
@@ -183,47 +140,9 @@ export async function ensureManagementNo7(firestore) {
 
 /* ================= OCR ================= */
 
-function angleDeg(p1 = {}, p2 = {}) {
-  const dx = (p2.x ?? 0) - (p1.x ?? 0);
-  const dy = (p2.y ?? 0) - (p1.y ?? 0);
-  const rad = Math.atan2(dy, dx);
-  let deg = (rad * 180) / Math.PI;
-  if (deg < 0) deg += 360;
-  return deg;
-}
-
-function quantizeRotation(deg) {
-  const c = [0, 90, 180, 270];
-  let best = 0;
-  let bestDiff = 99999;
-  for (const x of c) {
-    const d = Math.min(Math.abs(deg - x), 360 - Math.abs(deg - x));
-    if (d < bestDiff) {
-      bestDiff = d;
-      best = x;
-    }
-  }
-  return best;
-}
-
-function estimatePageRotationFromBlocks(page) {
-  const votes = { 0: 0, 90: 0, 180: 0, 270: 0 };
-  const blocks = page?.blocks || [];
-
-  for (const b of blocks) {
-    const v = b.boundingBox?.vertices || [];
-    if (v.length >= 2) {
-      const deg = angleDeg(v[0], v[1]);
-      votes[quantizeRotation(deg)]++;
-    }
-  }
-
-  return Number(Object.entries(votes).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 0);
-}
-
 async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const info = parseGsUri(gcsUri);
-  if (!info) return { text: "", rotation: 0 };
+  if (!info) return { text: "" };
 
   const tmpPrefix = `_vision/${Date.now()}_${Math.random()
     .toString(36)
@@ -246,7 +165,7 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const [files] = await storage
     .bucket(info.bucket)
     .getFiles({ prefix: tmpPrefix });
-  if (!files.length) return { text: "", rotation: 0 };
+  if (!files.length) return { text: "" };
 
   const [buf] = await files[0].download();
   await Promise.all(files.map((f) => f.delete().catch(() => {})));
@@ -254,30 +173,21 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
   const json = JSON.parse(buf.toString());
   const resp = json.responses?.[0];
   const text = resp?.fullTextAnnotation?.text || "";
-  const page = resp?.fullTextAnnotation?.pages?.[0];
 
-  return {
-    text,
-    rotation: page ? estimatePageRotationFromBlocks(page) : 0,
-  };
+  return { text };
 }
 
-async function ocrImageTextWithRotation(gcsUri) {
+async function ocrImageText(gcsUri) {
   const [res] = await client.documentTextDetection(gcsUri);
   const text =
     res.fullTextAnnotation?.text ||
     res.textAnnotations?.[0]?.description ||
     "";
-  const page = res.fullTextAnnotation?.pages?.[0];
-  return {
-    text,
-    rotation: page ? estimatePageRotationFromBlocks(page) : 0,
-  };
+  return { text };
 }
 
 async function runOcr(attachments) {
   let fullOcrText = "";
-  let firstPageRotation = null;
 
   for (const uri of attachments || []) {
     if (!uri?.startsWith("gs://")) continue;
@@ -290,12 +200,11 @@ async function runOcr(attachments) {
       } else if (lower.endsWith(".tif") || lower.endsWith(".tiff")) {
         r = await ocrFirstPageFromFile(uri, "image/tiff");
       } else {
-        r = await ocrImageTextWithRotation(uri);
+        r = await ocrImageText(uri);
       }
 
       if (r?.text) {
         fullOcrText += (fullOcrText ? "\n" : "") + r.text;
-        if (firstPageRotation == null) firstPageRotation = r.rotation;
       }
     } catch (e) {
       console.warn("OCR failed:", uri, e);
@@ -304,11 +213,10 @@ async function runOcr(attachments) {
 
   return {
     fullOcrText,
-    firstPageRotation: firstPageRotation ?? 0,
   };
 }
 
-/* ================= 顧客特定（オリジナルのまま） ================= */
+/* ================= 顧客特定 ================= */
 
 async function detectCustomer(firestore, sourceText) {
   try {
@@ -337,18 +245,9 @@ async function detectCustomer(firestore, sourceText) {
   return null;
 }
 
-/* ================= GCS URI parse & HTML escape ================= */
+/* ================= GCS URI parse ================= */
 
 function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
