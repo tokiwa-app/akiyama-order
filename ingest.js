@@ -6,6 +6,9 @@
  * - mail: message_attachments に保存（case_id必須）
  * - fax : message_main_pdf_files だけ保存（case_id必須）
  * - OCR/顧客特定はここでやらない
+ *
+ * 変更点:
+ * - mailのHTMLを捨てない: messages.body_html に保存する
  */
 export function registerIngestRoutes(app, deps) {
   const {
@@ -91,6 +94,7 @@ export function registerIngestRoutes(app, deps) {
             receivedAtIso
           );
 
+          // messages 先にinsert（case_id必須）
           const { error: insMsgErr } = await supabase
             .from("messages")
             .insert({
@@ -100,10 +104,17 @@ export function registerIngestRoutes(app, deps) {
               subject: subject ?? null,
               from_email: from ?? null,
               to_email: to ?? null,
+              // cc は現状カラムが無い前提（必要なら追加して保存）
               received_at: receivedAtIso,
               snippet: full.data.snippet ?? null,
               main_pdf_path: null,
-              body_text: textPlain ? textPlain : (textHtml ? textHtml : ""),
+
+              // ★変更点：mailのHTMLを捨てない
+              // - plainは body_text
+              // - htmlは body_html
+              body_text: textPlain || "",
+              body_html: textHtml || null,
+
               body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
               processed_at: null,
               processing_at: null,
