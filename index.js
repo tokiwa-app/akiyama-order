@@ -4,8 +4,7 @@ import { google } from "googleapis";
 import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
 import path from "path";
-import { CloudTasksClient } from "@google-cloud/tasks";
-import { runAfterProcess } from "./afterProcess.js";
+import { runAfterProcess } from "./afterProcess.js"; // ← 追加
 
 // ==== 環境変数 ====
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
@@ -19,24 +18,12 @@ const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null;
 const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase();
 const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
 
-// Cloud Tasks
-const tasksClient = new CloudTasksClient();
-const GCP_PROJECT =
-  process.env.GCP_PROJECT || process.env.GOOGLE_CLOUD_PROJECT;
-const GCP_LOCATION = process.env.GCP_LOCATION || "asia-northeast1";
-const TASKS_QUEUE = process.env.TASKS_QUEUE || "gmail-afterprocess";
-const SERVICE_URL =
-  process.env.SERVICE_URL ||
-  "https://akiyama-order-bta7jpi4pq-dt.a.run.app";
-
 // ==== 初期化 ====
 const app = express();
 app.use(express.json());
-
 const db = new Firestore(
   FIREBASE_PROJECT_ID ? { projectId: FIREBASE_PROJECT_ID } : {}
 );
-
 const storage = new Storage();
 const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
 
@@ -98,6 +85,7 @@ async function storeRefreshToken(token) {
     .doc("gmail_oauth")
     .set({ refresh_token: token, updatedAt: Date.now() }, { merge: true });
 }
+
 async function getGmail() {
   const refresh = await getStoredRefreshToken();
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && refresh) {
@@ -112,55 +100,31 @@ async function getGmail() {
   throw new Error("No OAuth refresh token available.");
 }
 
-// ==== Cloud Tasks enqueue ====
-async function enqueueTask(pathname, payload) {
-  const parent = tasksClient.queuePath(GCP_PROJECT, GCP_LOCATION, TASKS_QUEUE);
-  const task = {
-    httpRequest: {
-      httpMethod: "POST",
-      url: `${SERVICE_URL}${pathname}`,
-      headers: { "Content-Type": "application/json" },
-      body: Buffer.from(JSON.stringify(payload)).toString("base64"),
-    },
-  };
-  await tasksClient.createTask({ parent, task });
-}
-async function enqueueSyncBasic(messageId) {
-  await enqueueTask("/gmail/sync", { messageId });
-}
-async function enqueueAfterProcess(messageId) {
-  await enqueueTask("/gmail/process", { messageId });
-}
-
 // ==== 添付保存 ====
 async function saveAttachmentToGCS(userEmail, messageId, part) {
   if (!bucket) return null;
   const attachId = part?.body?.attachmentId;
   if (!attachId) return null;
-
   const gmail = await getGmail();
   const res = await gmail.users.messages.attachments.get({
     userId: "me",
     messageId,
     id: attachId,
   });
-
   const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
   const bytes = Buffer.from(b64, "base64");
   const filename = safeFilename(part.filename || `attachment-${attachId}`);
   const objectPath = `gmail/${encodeURIComponent(
     userEmail
   )}/${messageId}/${filename}`;
-
   await bucket.file(objectPath).save(bytes, {
     resumable: false,
     metadata: { contentType: part.mimeType || "application/octet-stream" },
   });
-
   return `gs://${GCS_BUCKET}/${objectPath}`;
 }
 
-// ==== Firestore保存（軽い処理のみ）====
+// ==== メッセージ保存 ====
 async function saveMessageDoc(emailAddress, m) {
   const payload = m.data.payload;
   const headers = payload?.headers || [];
@@ -169,18 +133,15 @@ async function saveMessageDoc(emailAddress, m) {
   const to = getHeader(headers, "To");
   const cc = getHeader(headers, "Cc");
   const dateHdr = getHeader(headers, "Date");
-
   const internalDateMs = m.data.internalDate
     ? Number(m.data.internalDate)
     : Date.parse(dateHdr);
-
   const { textPlain, textHtml } = extractBodies(payload);
 
   const addrMatch = (from || "").match(/<([^>]+)>/);
   const fromEmail = (addrMatch ? addrMatch[1] : (from || ""))
     .trim()
     .toLowerCase();
-
   const messageType =
     FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
 
@@ -188,8 +149,8 @@ async function saveMessageDoc(emailAddress, m) {
   const parts = flattenParts(payload?.parts || []);
   for (const p of parts) {
     if (p?.filename && p.body?.attachmentId) {
-      const gcsPath = await saveAttachmentToGCS(emailAddress, m.data.id, p);
-      if (gcsPath) attachments.push(gcsPath);
+      const path = await saveAttachmentToGCS(emailAddress, m.data.id, p);
+      if (path) attachments.push(path);
     }
   }
 
@@ -218,6 +179,9 @@ async function saveMessageDoc(emailAddress, m) {
       },
       { merge: true }
     );
+
+  // ✅ ここで後処理呼び出し
+  await runAfterProcess({ messageId: m.data.id, firestore: db, bucket });
 }
 
 // ==== ルーティング ====
@@ -238,7 +202,7 @@ app.get("/oauth2/start", async (_req, res) => {
       scope: ["https://www.googleapis.com/auth/gmail.readonly"],
     });
     res.redirect(url);
-  } catch (_e) {
+  } catch (e) {
     res.status(500).send("oauth start error");
   }
 });
@@ -257,50 +221,17 @@ app.get("/oauth2/callback", async (req, res) => {
     const { tokens } = await oAuth2.getToken(code);
     if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
     res.status(200).send("linked");
-  } catch (_e) {
+  } catch (e) {
     res.status(500).send("oauth callback error");
   }
 });
 
-// ---- Cloud Tasks: basic sync (after不要) ----
-app.post("/gmail/sync", async (req, res) => {
-  try {
-    const { messageId } = req.body || {};
-    if (!messageId) return res.status(400).send("missing messageId");
-
-    const { mirrorMessageToSupabaseBasic } = await import("./supabaseSync.js");
-    await mirrorMessageToSupabaseBasic({ messageId, firestore: db });
-
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("/gmail/sync error:", e);
-    return res.status(500).send("error");
-  }
-});
-
-// ---- Cloud Tasks: heavy afterProcess ----
-app.post("/gmail/process", async (req, res) => {
-  try {
-    const { messageId } = req.body || {};
-    if (!messageId) return res.status(400).send("missing messageId");
-
-    await runAfterProcess({ messageId, firestore: db, bucket });
-
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("/gmail/process error:", e);
-    return res.status(500).send("error");
-  }
-});
-
-// ---- Poll (Cloud Scheduler) ----
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
   try {
     const gmail = await getGmail();
     const profile = await gmail.users.getProfile({ userId: "me" });
     const emailAddress = profile.data.emailAddress || "me";
-
     const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
     const minutes =
       Number.isFinite(minutesParam) && minutesParam > 0
@@ -322,7 +253,6 @@ app.post("/gmail/poll", async (req, res) => {
         maxResults: 200,
       });
       pageToken = list.data.nextPageToken || null;
-
       const ids = (list.data.messages || []).map((m) => m.id);
       if (!ids.length) break;
 
@@ -330,21 +260,12 @@ app.post("/gmail/poll", async (req, res) => {
         seen++;
         const doc = await db.collection("messages").doc(id).get();
         if (doc.exists) continue;
-
         const full = await gmail.users.messages.get({
           userId: "me",
           id,
           format: "full",
         });
-
         await saveMessageDoc(emailAddress, full);
-
-        // ✅ after が落ちてもSupabaseに入るように、先にbasic同期
-        await enqueueSyncBasic(id);
-
-        // ✅ その後、重い after
-        await enqueueAfterProcess(id);
-
         newCount++;
       }
     } while (pageToken);
