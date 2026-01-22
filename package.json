@@ -16,7 +16,7 @@
     "p-limit": "^4.0.0",
 
     "@supabase/supabase-js": "^2.0.0",
-    "puppeteer": "^22.7.1"
+    "puppeteer": "^22.7.1",
     "mailparser": "^3.x.x"
   }
 }
