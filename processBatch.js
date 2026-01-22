@@ -1,15 +1,18 @@
 // processBatch.js
+import puppeteer from "puppeteer";
+
 /**
  * 2) pending を少量処理
  * - messages から未処理を取ってロック
  * - fax: message_main_pdf_files からPDF取得 → OCR → 顧客特定 → cases/messages 更新
- * - mail: body_text で顧客特定（必要なら）
+ * - mail: body_text/body_html(+必要ならヘッダ)で顧客特定、さらに HTML→PDF を後処理で生成
  */
 export function registerProcessBatchRoutes(app, deps) {
   const {
     supabase,
     runOcrForAttachments,
     detectCustomerFromMaster,
+    bucket, // ★ index.js からdepsで渡ってくる（既に渡している前提）
   } = deps;
 
   app.post("/gmail/process-batch", async (req, res) => {
@@ -20,7 +23,7 @@ export function registerProcessBatchRoutes(app, deps) {
     try {
       const { data: rows, error: selErr } = await supabase
         .from("messages")
-        .select("id, case_id, message_type, subject, body_text, received_at")
+        .select("id, case_id, message_type, subject, body_text, body_html, from_email, to_email, received_at, main_pdf_path")
         .is("processed_at", null)
         .or(`processing_at.is.null,processing_at.lt.${new Date(Date.now() - lockMinutes * 60 * 1000).toISOString()}`)
         .order("received_at", { ascending: false })
@@ -32,6 +35,8 @@ export function registerProcessBatchRoutes(app, deps) {
 
       for (const m of rows || []) {
         const nowIso = new Date().toISOString();
+
+        // ロック（※現状の実装思想を保ちつつ。より厳密にするなら条件を追加推奨）
         const { error: lockErr } = await supabase
           .from("messages")
           .update({ processing_at: nowIso, ocr_status: "processing", ocr_error: null })
@@ -59,11 +64,50 @@ export function registerProcessBatchRoutes(app, deps) {
             attachments = (pdfRows || []).map((r) => r.gcs_path).filter(Boolean);
             mainPdfPath = attachments[0] || null;
           } else {
-            const { data: attRows } = await supabase
+            const { data: attRows, error: attErr } = await supabase
               .from("message_attachments")
               .select("gcs_path")
               .eq("message_id", m.id);
+
+            if (attErr) throw attErr;
             attachments = (attRows || []).map((r) => r.gcs_path).filter(Boolean);
+
+            // ★mail: HTML→PDF を後処理で生成し、mainにする（既にあるならスキップ）
+            if (!m.main_pdf_path) {
+              const htmlSource =
+                m.body_html ||
+                (m.body_text ? `<pre>${escapeHtml(String(m.body_text))}</pre>` : null);
+
+              if (htmlSource) {
+                try {
+                  const rendered = await renderMailHtmlToPdfToGcs({
+                    bucket,
+                    messageId: m.id,
+                    html: htmlSource,
+                  });
+
+                  if (rendered) {
+                    mainPdfPath = rendered;
+
+                    // message_main_pdf_files に登録（mail_rendered）
+                    await supabase.from("message_main_pdf_files").insert({
+                      case_id: m.case_id,
+                      message_id: m.id,
+                      gcs_path: mainPdfPath,
+                      file_name: mainPdfPath.split("/").pop() || null,
+                      mime_type: "application/pdf",
+                      file_type: "mail_rendered",
+                      thumbnail_path: null,
+                    });
+                  }
+                } catch (e) {
+                  console.error("mail html=>pdf failed:", m.id, e?.message || e);
+                }
+              }
+            } else {
+              // 既にmainがあるならそれを使う（レンダ再生成しない）
+              mainPdfPath = m.main_pdf_path;
+            }
           }
 
           let ocrText = "";
@@ -74,8 +118,14 @@ export function registerProcessBatchRoutes(app, deps) {
             const head = String(ocrText || "").slice(0, 200);
             customer = (head && (await detectCustomerFromMaster(head))) || (await detectCustomerFromMaster(ocrText));
           } else {
-            const head = String(m.body_text || "").slice(0, 300);
-            customer = (head && (await detectCustomerFromMaster(head))) || (await detectCustomerFromMaster(m.body_text || ""));
+            // ★mail: body + subject + ヘッダも含めて顧客特定（アドレス確定が効く）
+            const source =
+              `${m.subject || ""}\n${m.from_email || ""}\n${m.to_email || ""}\n${m.body_text || ""}\n${m.body_html || ""}`;
+
+            const head = String(source || "").slice(0, 400);
+            customer =
+              (head && (await detectCustomerFromMaster(head))) ||
+              (await detectCustomerFromMaster(source));
           }
 
           // cases 更新（顧客が取れた場合）
@@ -127,4 +177,49 @@ export function registerProcessBatchRoutes(app, deps) {
       res.status(500).send("error");
     }
   });
+}
+
+/* ================= HTML → PDF（メール用） ================= */
+
+function sanitizeId(id) {
+  return String(id || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120);
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function renderMailHtmlToPdfToGcs({ bucket, messageId, html }) {
+  if (!bucket) throw new Error("GCS bucket is not configured");
+
+  const safeId = sanitizeId(messageId);
+  const objectPath = `mail_rendered/${safeId}.pdf`;
+
+  const browser = await puppeteer.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+    });
+
+    await bucket.file(objectPath).save(pdfBuffer, {
+      resumable: false,
+      metadata: { contentType: "application/pdf" },
+    });
+
+    return `gs://${bucket.name}/${objectPath}`;
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
