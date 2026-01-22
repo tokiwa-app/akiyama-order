@@ -4,7 +4,7 @@ import { google } from "googleapis";
 import { Firestore } from "@google-cloud/firestore";
 import { Storage } from "@google-cloud/storage";
 import path from "path";
-import { runAfterProcess } from "./afterProcess.js"; // ← 追加
+import { runAfterProcess } from "./afterProcess.js";
 
 // ==== 環境変数 ====
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
@@ -26,6 +26,14 @@ const db = new Firestore(
 );
 const storage = new Storage();
 const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
+
+// ==== logging util ====
+function msSince(t0) {
+  return Date.now() - t0;
+}
+function logStep(reqId, msg, extra = {}) {
+  console.log(`[${reqId}] ${msg}`, extra);
+}
 
 // ==== ユーティリティ ====
 function b64UrlDecode(data) {
@@ -125,7 +133,8 @@ async function saveAttachmentToGCS(userEmail, messageId, part) {
 }
 
 // ==== メッセージ保存 ====
-async function saveMessageDoc(emailAddress, m) {
+async function saveMessageDoc(emailAddress, m, reqId) {
+  const t0 = Date.now();
   const payload = m.data.payload;
   const headers = payload?.headers || [];
   const subject = getHeader(headers, "Subject");
@@ -149,11 +158,18 @@ async function saveMessageDoc(emailAddress, m) {
   const parts = flattenParts(payload?.parts || []);
   for (const p of parts) {
     if (p?.filename && p.body?.attachmentId) {
-      const path = await saveAttachmentToGCS(emailAddress, m.data.id, p);
-      if (path) attachments.push(path);
+      const tA = Date.now();
+      const pth = await saveAttachmentToGCS(emailAddress, m.data.id, p);
+      logStep(reqId, "saveAttachmentToGCS done", {
+        ms: msSince(tA),
+        hasPath: !!pth,
+        filename: p.filename,
+      });
+      if (pth) attachments.push(pth);
     }
   }
 
+  const t1 = Date.now();
   await db
     .collection("messages")
     .doc(m.data.id)
@@ -174,14 +190,22 @@ async function saveMessageDoc(emailAddress, m) {
         attachments,
         gcsBucket: GCS_BUCKET || null,
         messageType,
+        processedAt: null,     // ★ 未処理を明示
+        processingAt: null,    // ★ ロック用
         updatedAt: Date.now(),
         createdAt: Date.now(),
       },
       { merge: true }
     );
+  logStep(reqId, "Firestore set message done", { ms: msSince(t1) });
 
-  // ✅ ここで後処理呼び出し
-  await runAfterProcess({ messageId: m.data.id, firestore: db, bucket });
+  // ✅ ここで後処理呼び出し（FAXのみと言っているので、ここが重い/止まる可能性大）
+  const t2 = Date.now();
+  logStep(reqId, "runAfterProcess START", { messageId: m.data.id, messageType });
+  await runAfterProcess({ messageId: m.data.id, firestore: db, bucket, reqId });
+  logStep(reqId, "runAfterProcess END", { ms: msSince(t2) });
+
+  logStep(reqId, "saveMessageDoc TOTAL", { ms: msSince(t0), messageId: m.data.id });
 }
 
 // ==== ルーティング ====
@@ -228,9 +252,18 @@ app.get("/oauth2/callback", async (req, res) => {
 
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
+  const reqId = `poll_${started}_${Math.random().toString(36).slice(2, 8)}`;
+  logStep(reqId, "POLL START");
+
   try {
+    const tG = Date.now();
     const gmail = await getGmail();
+    logStep(reqId, "got gmail", { ms: msSince(tG) });
+
+    const tP = Date.now();
     const profile = await gmail.users.getProfile({ userId: "me" });
+    logStep(reqId, "got profile", { ms: msSince(tP) });
+
     const emailAddress = profile.data.emailAddress || "me";
     const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
     const minutes =
@@ -241,41 +274,64 @@ app.post("/gmail/poll", async (req, res) => {
     const cutoffEpoch = Math.floor((Date.now() - minutes * 60 * 1000) / 1000);
     const q = `after:${cutoffEpoch} in:inbox`;
 
+    logStep(reqId, "query built", { minutes, cutoffEpoch, q });
+
     let pageToken;
     let newCount = 0;
     let seen = 0;
 
     do {
+      const tL = Date.now();
       const list = await gmail.users.messages.list({
         userId: "me",
         q,
         pageToken,
         maxResults: 200,
       });
+      logStep(reqId, "messages.list done", {
+        ms: msSince(tL),
+        hasNext: !!list.data.nextPageToken,
+        count: (list.data.messages || []).length,
+      });
+
       pageToken = list.data.nextPageToken || null;
       const ids = (list.data.messages || []).map((m) => m.id);
       if (!ids.length) break;
 
       for (const id of ids) {
         seen++;
+        const tD = Date.now();
         const doc = await db.collection("messages").doc(id).get();
+        logStep(reqId, "Firestore get message doc", { ms: msSince(tD), id, exists: doc.exists });
+
         if (doc.exists) continue;
+
+        const tF = Date.now();
+        logStep(reqId, "messages.get START", { id });
         const full = await gmail.users.messages.get({
           userId: "me",
           id,
           format: "full",
         });
-        await saveMessageDoc(emailAddress, full);
+        logStep(reqId, "messages.get END", { ms: msSince(tF), id });
+
+        logStep(reqId, "saveMessageDoc START", { id });
+        await saveMessageDoc(emailAddress, full, reqId);
+        logStep(reqId, "saveMessageDoc END", { id });
+
         newCount++;
       }
     } while (pageToken);
 
     const ms = Date.now() - started;
+    logStep(reqId, "POLL END", { ms, seen, newCount });
+
     res
       .status(200)
       .send(`OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`);
   } catch (e) {
-    console.error("/gmail/poll error:", e);
+    console.error(`[${reqId}] /gmail/poll error:`, e);
+    // ※ ここは本当は 500 を返したほうが監視しやすい
     res.status(200).send("OK (partial or error logged)");
   }
 });
