@@ -201,7 +201,6 @@ async function ocrFirstPageFromFile(gcsUri, mimeType) {
     ],
   });
 
-  // ★ “止まる” を防ぐ：ここでタイムアウト
   await withTimeout(op.promise(), 150000, "vision op.promise");
 
   const [files] = await storage.bucket(info.bucket).getFiles({ prefix: tmpPrefix });
@@ -226,7 +225,11 @@ async function runOcrForAttachments(attachments) {
       if (lower.endsWith(".pdf")) r = await ocrFirstPageFromFile(uri, "application/pdf");
       else if (lower.endsWith(".tif") || lower.endsWith(".tiff")) r = await ocrFirstPageFromFile(uri, "image/tiff");
       else {
-        const [res] = await withTimeout(visionClient.documentTextDetection(uri), 60000, "vision documentTextDetection(image)");
+        const [res] = await withTimeout(
+          visionClient.documentTextDetection({ image: { source: { imageUri: uri } } }),
+          60000,
+          "vision documentTextDetection(image)"
+        );
         const text =
           res.fullTextAnnotation?.text ||
           res.textAnnotations?.[0]?.description ||
@@ -244,7 +247,6 @@ async function runOcrForAttachments(attachments) {
 
 // ================== Supabase helpers ==================
 async function upsertCaseByManagementNo(managementNo, customerId, customerName, title, receivedAtIso) {
-  // cases.management_no をユニーク前提
   const { data: existing, error: selErr } = await supabase
     .from("cases")
     .select("id")
@@ -288,10 +290,11 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 
 /**
  * 1) Gmail → Supabase ingest
- * - Firestoreは使わない
- * - 添付はGCSに保存
- * - Supabase messages.id = Gmail messageId
- * - 重処理(OCR/顧客特定)はここではやらない（ここ重要）
+ * - 先に cases を作る（messages.case_id NOT NULL 前提）
+ * - 添付は GCS 保存
+ * - mail: message_attachments に保存（case_id必須）
+ * - fax : message_main_pdf_files だけ保存（case_id必須）
+ * - OCR/顧客特定はここでやらない
  */
 app.post("/gmail/poll", async (req, res) => {
   const started = Date.now();
@@ -325,7 +328,6 @@ app.post("/gmail/poll", async (req, res) => {
       for (const id of ids) {
         seen++;
 
-        // 既に Supabase にあるならスキップ（高速化）
         const { data: existsRow, error: exErr } = await supabase
           .from("messages")
           .select("id")
@@ -354,6 +356,38 @@ app.post("/gmail/poll", async (req, res) => {
         const fromEmail = (addrMatch ? addrMatch[1] : (from || "")).trim().toLowerCase();
         const messageType = FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
 
+        const threadId = full.data.threadId || id;
+        const managementNo = `gmail_${threadId}`;
+
+        const caseId = await upsertCaseByManagementNo(
+          managementNo,
+          null,
+          null,
+          subject ?? null,
+          receivedAtIso
+        );
+
+        const { error: insMsgErr } = await supabase
+          .from("messages")
+          .insert({
+            id,
+            case_id: caseId,
+            message_type: messageType,
+            subject: subject ?? null,
+            from_email: from ?? null,
+            to_email: to ?? null,
+            received_at: receivedAtIso,
+            snippet: full.data.snippet ?? null,
+            main_pdf_path: null,
+            body_text: textPlain ? textPlain : (textHtml ? textHtml : ""),
+            body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
+            processed_at: null,
+            processing_at: null,
+            ocr_status: "pending",
+          });
+
+        if (insMsgErr) throw insMsgErr;
+
         // 添付保存（GCS）
         const attachments = [];
         const parts = flattenParts(payload?.parts || []);
@@ -364,47 +398,40 @@ app.post("/gmail/poll", async (req, res) => {
           }
         }
 
-        // cases/mgmtNo はここでは未確定でもOK
-        // まず messages を作って「未処理」で積む
-        const { error: insMsgErr } = await supabase
-          .from("messages")
-          .insert({
-            id,
-            case_id: null,
-            message_type: messageType,
-            subject: subject ?? null,
-            from_email: from ?? null,
-            to_email: to ?? null,
-            received_at: receivedAtIso,
-            snippet: full.data.snippet ?? null,
-            main_pdf_path: null,
+        if (messageType === "mail") {
+          if (attachments.length > 0) {
+            const rows = attachments.map((p) => ({
+              case_id: caseId,
+              message_id: id,
+              gcs_path: p,
+              file_name: typeof p === "string" ? p.split("/").pop() || null : null,
+              mime_type: null,
+            }));
+            const { error: attErr } = await supabase.from("message_attachments").insert(rows);
+            if (attErr) console.error("insert message_attachments error:", attErr);
+          }
+        } else {
+          const pdf = attachments.find((p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf"));
+          const any = attachments.find((p) => typeof p === "string");
+          const mainPdfPath = pdf || any || null;
 
-            // raw保存（あれば）
-            body_text: textPlain ? textPlain : (textHtml ? textHtml : ""),
-            body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
+          if (mainPdfPath) {
+            await supabase.from("messages").update({ main_pdf_path: mainPdfPath }).eq("id", id);
 
-            processed_at: null,
-            processing_at: null,
-            ocr_status: "pending",
-          });
-
-        if (insMsgErr) throw insMsgErr;
-
-        // 添付テーブル（mailのみ）: 既存設計踏襲
-        if (messageType !== "fax" && attachments.length > 0) {
-          const rows = attachments.map((p) => ({
-            case_id: null,
-            message_id: id,
-            gcs_path: p,
-            file_name: typeof p === "string" ? p.split("/").pop() || null : null,
-            mime_type: null,
-          }));
-          const { error: attErr } = await supabase.from("message_attachments").insert(rows);
-          if (attErr) console.error("insert message_attachments error:", attErr);
+            const row = {
+              case_id: caseId,
+              message_id: id,
+              gcs_path: mainPdfPath,
+              file_name: typeof mainPdfPath === "string" ? mainPdfPath.split("/").pop() || null : null,
+              mime_type: "application/pdf",
+              file_type: "fax_original",
+              thumbnail_path: null,
+            };
+            const { error: mainErr } = await supabase.from("message_main_pdf_files").insert(row);
+            if (mainErr) console.error("insert message_main_pdf_files error:", mainErr);
+          }
         }
 
-        // fax の main pdf は後で確定するが、今入れてもOKならここで入れる（最初のpdfを採用）
-        // ここでは insert だけにして、process-batch が upsert で整える形が安全
         ingested++;
       }
     } while (pageToken);
@@ -417,10 +444,10 @@ app.post("/gmail/poll", async (req, res) => {
 });
 
 /**
- * 2) pending を少量処理（Cloud Tasksなし用）
- * - Supabase から未処理をN件取る
- * - processing_at を立ててロック
- * - fax: OCR → 顧客特定(Firestore) → cases作成/紐付け → main_pdf_path埋める → processed_at
+ * 2) pending を少量処理
+ * - messages から未処理を取ってロック
+ * - fax: message_main_pdf_files からPDF取得 → OCR → 顧客特定 → cases/messages 更新
+ * - mail: body_text で顧客特定（必要なら）
  */
 app.post("/gmail/process-batch", async (req, res) => {
   const started = Date.now();
@@ -428,10 +455,9 @@ app.post("/gmail/process-batch", async (req, res) => {
   const lockMinutes = 10;
 
   try {
-    // 未処理を取得（処理中ロックが古いものは拾ってOK）
     const { data: rows, error: selErr } = await supabase
       .from("messages")
-      .select("id, message_type, subject, body_text, received_at")
+      .select("id, case_id, message_type, subject, body_text, received_at")
       .is("processed_at", null)
       .or(`processing_at.is.null,processing_at.lt.${new Date(Date.now() - lockMinutes * 60 * 1000).toISOString()}`)
       .order("received_at", { ascending: false })
@@ -442,7 +468,6 @@ app.post("/gmail/process-batch", async (req, res) => {
     let processed = 0;
 
     for (const m of rows || []) {
-      // lock
       const nowIso = new Date().toISOString();
       const { error: lockErr } = await supabase
         .from("messages")
@@ -456,55 +481,57 @@ app.post("/gmail/process-batch", async (req, res) => {
       }
 
       try {
-        // 添付（GCSパス）は message_attachments / message_main_pdf_files からも拾えるが、
-        // まずは message_attachments を見に行く（faxは添付を別テーブルに入れてないならここで別取得にする）
-        const { data: attRows } = await supabase
-          .from("message_attachments")
-          .select("gcs_path")
-          .eq("message_id", m.id);
-
-        const attachments = (attRows || []).map((r) => r.gcs_path).filter(Boolean);
-
-        let ocrText = "";
-        let customer = null;
+        let attachments = [];
         let mainPdfPath = null;
 
         if (m.message_type === "fax") {
-          // fax の場合：PDF添付を main とする（最初の gs:// を採用）
-          const pdf = attachments.find((p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf"));
-          const any = attachments.find((p) => typeof p === "string");
-          mainPdfPath = pdf || any || null;
+          const { data: pdfRows, error: pdfErr } = await supabase
+            .from("message_main_pdf_files")
+            .select("gcs_path")
+            .eq("message_id", m.id)
+            .order("created_at", { ascending: true })
+            .limit(10);
 
-          // OCR（重いのでタイムアウトあり）
+          if (pdfErr) throw pdfErr;
+          attachments = (pdfRows || []).map((r) => r.gcs_path).filter(Boolean);
+          mainPdfPath = attachments[0] || null;
+        } else {
+          const { data: attRows } = await supabase
+            .from("message_attachments")
+            .select("gcs_path")
+            .eq("message_id", m.id);
+          attachments = (attRows || []).map((r) => r.gcs_path).filter(Boolean);
+        }
+
+        let ocrText = "";
+        let customer = null;
+
+        if (m.message_type === "fax") {
           ocrText = await runOcrForAttachments(attachments);
-
-          // 顧客特定（Firestore）
           const head = String(ocrText || "").slice(0, 200);
           customer = (head && (await detectCustomerFromMaster(head))) || (await detectCustomerFromMaster(ocrText));
         } else {
-          // mail の場合もここで customer 推定するなら body_text でやる
           const head = String(m.body_text || "").slice(0, 300);
           customer = (head && (await detectCustomerFromMaster(head))) || (await detectCustomerFromMaster(m.body_text || ""));
         }
 
-        // management_no は「cases」を正にするなら、ここで生成/採番が必要
-        // ここでは最小として "messageId を mgmt にする" 仮置きにしてるので、後で採番方式を決めよう。
-        const managementNo = m.id; // ★仮（あとで変更）
+        // cases 更新（顧客が取れた場合）
+        if (m.case_id && (customer?.id || customer?.name)) {
+          await supabase
+            .from("cases")
+            .update({
+              customer_id: customer?.id ?? null,
+              customer_name: customer?.name ?? null,
+              latest_message_at: m.received_at ?? null,
+              title: m.subject ?? null,
+            })
+            .eq("id", m.case_id);
+        }
 
-        const caseId = await upsertCaseByManagementNo(
-          managementNo,
-          customer?.id ?? null,
-          customer?.name ?? null,
-          m.subject ?? null,
-          m.received_at
-        );
-
-        // messages 更新（確定情報）
         const { error: updErr } = await supabase
           .from("messages")
           .update({
-            case_id: caseId,
-            main_pdf_path: mainPdfPath,
+            main_pdf_path: mainPdfPath ?? null,
             ocr_text: ocrText,
             customer_id: customer?.id ?? null,
             customer_name: customer?.name ?? null,
@@ -515,21 +542,6 @@ app.post("/gmail/process-batch", async (req, res) => {
           .eq("id", m.id);
 
         if (updErr) throw updErr;
-
-        // main pdf 管理テーブル（あるなら）へ insert（重複対策はあなたのDB制約に合わせて）
-        if (mainPdfPath) {
-          const row = {
-            case_id: caseId,
-            message_id: m.id,
-            gcs_path: mainPdfPath,
-            file_name: typeof mainPdfPath === "string" ? mainPdfPath.split("/").pop() || null : null,
-            mime_type: "application/pdf",
-            file_type: m.message_type === "fax" ? "fax_original" : "mail_rendered",
-            thumbnail_path: null,
-          };
-          const { error: mainErr } = await supabase.from("message_main_pdf_files").insert(row);
-          if (mainErr) console.error("insert message_main_pdf_files error:", mainErr);
-        }
 
         processed++;
       } catch (e) {
