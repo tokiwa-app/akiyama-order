@@ -133,8 +133,8 @@ export function registerProcessBatchRoutes(app, deps) {
             await supabase
               .from("cases")
               .update({
-                customer_id: customer?.id ?? null,
-                customer_name: customer?.name ?? null,
+                customer_id: customer?.id ?? 0,
+                customer_name: customer?.name ??  "未設定",
                 latest_message_at: m.received_at ?? null,
                 title: m.subject ?? null,
               })
@@ -146,8 +146,8 @@ export function registerProcessBatchRoutes(app, deps) {
             .update({
               main_pdf_path: mainPdfPath ?? null,
               ocr_text: ocrText,
-              customer_id: customer?.id ?? null,
-              customer_name: customer?.name ?? null,
+              customer_id: customer?.id ?? 0,
+              customer_name: customer?.name ??  "未設定",
               ocr_status: "done",
               processed_at: new Date().toISOString(),
               processing_at: null,
