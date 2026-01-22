@@ -1,198 +1,20 @@
 // supabaseSync.js
 import { supabase } from "./supabaseClient.js";
 
-function stripHtmlTags(html = "") {
-  return html.replace(/<[^>]*>/g, " ");
-}
-
-function getReceivedAt(data) {
-  if (typeof data.internalDate === "number") return new Date(data.internalDate);
-  if (data.receivedAt?.toDate) return data.receivedAt.toDate();
-  if (data.receivedAt instanceof Date) return data.receivedAt;
-  return new Date();
-}
-
-async function getMessageDoc(firestore, messageId) {
-  const snap = await firestore.collection("messages").doc(messageId).get();
-  if (!snap.exists) return null;
-  return snap.data();
-}
-
-async function ensureCaseByManagementNo(
-  managementNo,
-  customerId,
-  customerName,
-  title,
-  receivedAtIso
-) {
-  const { data: existing, error: selectErr } = await supabase
-    .from("cases")
-    .select("id")
-    .eq("management_no", managementNo)
-    .maybeSingle();
-
-  if (selectErr) throw selectErr;
-
-  if (existing) {
-    const { error: updateErr } = await supabase
-      .from("cases")
-      .update({
-        customer_id: customerId,
-        customer_name: customerName,
-        latest_message_at: receivedAtIso,
-        title: title ?? null,
-      })
-      .eq("id", existing.id);
-
-    if (updateErr) console.error("Supabase update cases error:", updateErr);
-    return existing.id;
-  }
-
-  const { data: inserted, error: insertErr } = await supabase
-    .from("cases")
-    .insert({
-      management_no: managementNo,
-      customer_id: customerId,
-      customer_name: customerName,
-      title: title ?? null,
-      latest_message_at: receivedAtIso,
-    })
-    .select()
-    .single();
-
-  if (insertErr) throw insertErr;
-  return inserted.id;
-}
-
-async function migrateCaseManagementNo(oldManagementNo, newManagementNo) {
-  if (!oldManagementNo || !newManagementNo || oldManagementNo === newManagementNo)
-    return;
-
-  const { data: oldCase, error: oldErr } = await supabase
-    .from("cases")
-    .select("id")
-    .eq("management_no", oldManagementNo)
-    .maybeSingle();
-
-  if (oldErr) {
-    console.error("Supabase select old case error:", oldErr);
-    return;
-  }
-  if (!oldCase) return;
-
-  const { data: newCase, error: newErr } = await supabase
-    .from("cases")
-    .select("id")
-    .eq("management_no", newManagementNo)
-    .maybeSingle();
-
-  if (newErr) {
-    console.error("Supabase select new case error:", newErr);
-    return;
-  }
-  if (newCase) return; // 衝突回避
-
-  const { error: updErr } = await supabase
-    .from("cases")
-    .update({ management_no: newManagementNo })
-    .eq("id", oldCase.id);
-
-  if (updErr) console.error("Supabase migrate case management_no error:", updErr);
-}
-
 /**
- * ✅ afterProcess不要の最低限同期
- * - cases.management_no は一旦 messageId を使う（仮case）
- * - messages は upsert
- * - 添付/PDFは full に任せる
+ * Firestore messages ドキュメント → Supabase に同期
+ *
+ * 対応テーブル:
+ *  - cases
+ *  - messages
+ *  - message_attachments
+ *  - message_main_pdf_files
  */
-export async function mirrorMessageToSupabaseBasic({ messageId, firestore }) {
-  try {
-    if (!supabase) {
-      console.error("Supabase client is not initialized.");
-      return;
-    }
-
-    const data = await getMessageDoc(firestore, messageId);
-    if (!data) return;
-
-    const receivedAt = getReceivedAt(data);
-    const receivedAtIso = receivedAt.toISOString();
-
-    const isFax = data.messageType === "fax";
-
-    let bodyText = "";
-    let bodyType = "basic";
-
-    if (!isFax) {
-      if (data.textPlain) bodyText = data.textPlain;
-      else if (data.textHtml) bodyText = stripHtmlTags(data.textHtml);
-      else bodyText = "";
-      bodyType = "mail_raw";
-    } else {
-      bodyText = data.snippet ?? "";
-      bodyType = "fax_basic";
-    }
-
-    const tempManagementNo = messageId;
-    console.log("🧩 basic sync start", {
-      messageId,
-      tempManagementNo,
-      messageType: data.messageType,
-    });
-
-    const customerId = data.customerId ?? null;
-    const customerName = data.customerName ?? null;
-
-    const caseId = await ensureCaseByManagementNo(
-      tempManagementNo,
-      customerId,
-      customerName,
-      data.subject ?? null,
-      receivedAtIso
-    );
-
-    const upsertPayload = {
-      id: messageId,
-      case_id: caseId,
-      message_type: data.messageType ?? null,
-      subject: data.subject ?? null,
-      from_email: data.from ?? null,
-      to_email: data.to ?? null,
-      received_at: receivedAtIso,
-      snippet: data.snippet ?? null,
-      main_pdf_path: null,
-      body_text: bodyText,
-      body_type: bodyType,
-    };
-
-    const { error: msgErr } = await supabase
-      .from("messages")
-      .upsert(upsertPayload, { onConflict: "id" });
-
-    if (msgErr) console.error("Supabase upsert messages error:", msgErr);
-
-    console.log(`✅ basic sync OK messageId=${messageId} caseId=${caseId}`);
-  } catch (e) {
-    console.error("mirrorMessageToSupabaseBasic exception:", e);
-    throw e;
-  }
-}
-
-/**
- * ✅ afterProcess成功後の完成同期
- * - 仮case (management_no=messageId) を本物 managementNo に移行
- * - messages / 添付 / main pdf を整合させる
- * - 添付/PDFは delete→insert で冪等化
- */
-export async function mirrorMessageToSupabaseFull({
+export async function mirrorMessageToSupabase({
   messageId,
-  firestore,
+  data,
   managementNo,
   customer,
-  mainPdfPath,
-  mainPdfThumbnailPath,
-  fullOcrText,
 }) {
   try {
     if (!supabase) {
@@ -200,115 +22,197 @@ export async function mirrorMessageToSupabaseFull({
       return;
     }
 
-    const data = await getMessageDoc(firestore, messageId);
-    if (!data) return;
-
-    const receivedAt = getReceivedAt(data);
-    const receivedAtIso = receivedAt.toISOString();
-
     const isFax = data.messageType === "fax";
-    const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+
+    console.log("🔁 mirrorMessageToSupabase start", {
+      messageId,
+      managementNo,
+      messageType: data.messageType,
+    });
+
+    // ---------- 受信日時 ----------
+    let receivedAt;
+    if (typeof data.internalDate === "number") {
+      receivedAt = new Date(data.internalDate);
+    } else if (data.receivedAt?.toDate) {
+      // Firestore Timestamp
+      receivedAt = data.receivedAt.toDate();
+    } else if (data.receivedAt instanceof Date) {
+      receivedAt = data.receivedAt;
+    } else {
+      receivedAt = new Date();
+    }
 
     const customerId = customer?.id ?? data.customerId ?? null;
     const customerName = customer?.name ?? data.customerName ?? null;
 
-    let bodyText = "";
-    let bodyType = "";
+    // ---------- 本文（mail: 生本文 / fax: OCR） ----------
+    let bodyText = null;
+    let bodyType = null;
 
     if (isFax) {
-      bodyText = fullOcrText ?? data.ocr?.fullText ?? "";
+      // fax: OCR の全文を保存したい
+      bodyText = data.ocr?.fullText ?? "";
       bodyType = "fax_ocr";
     } else {
-      if (data.textPlain) bodyText = data.textPlain;
-      else if (data.textHtml) bodyText = stripHtmlTags(data.textHtml);
-      else bodyText = "";
+      // mail: textPlain 優先、なければ HTML をテキスト化
+      if (data.textPlain) {
+        bodyText = data.textPlain;
+      } else if (data.textHtml) {
+        bodyText = stripHtmlTags(data.textHtml);
+      } else {
+        bodyText = "";
+      }
       bodyType = "mail_raw";
     }
 
-    const finalManagementNo = managementNo || data.managementNo;
-    if (!finalManagementNo) {
-      console.warn("full sync skipped: managementNo missing", { messageId });
-      return;
-    }
+    // ---------- メインPDFパス & サムネパス（afterProcess から渡される想定） ----------
+    let mainPdfPath = data.mainPdfPath ?? data.main_pdf_path ?? null;
+    let mainPdfThumbnailPath = data.mainPdfThumbnailPath ?? null;
 
-    console.log("🔁 full sync start", {
-      messageId,
-      finalManagementNo,
-      messageType: data.messageType,
-    });
+    // fax で mainPdfPath がまだ無い古いデータにも一応対応
+    const attachments = Array.isArray(data.attachments)
+      ? data.attachments
+      : [];
 
-    await migrateCaseManagementNo(messageId, finalManagementNo);
-
-    const caseId = await ensureCaseByManagementNo(
-      finalManagementNo,
-      customerId,
-      customerName,
-      data.subject ?? null,
-      receivedAtIso
-    );
-
-    const finalMainPdfPath =
-      mainPdfPath ?? data.mainPdfPath ?? data.main_pdf_path ?? null;
-
-    const upsertPayload = {
-      id: messageId,
-      case_id: caseId,
-      message_type: data.messageType ?? null,
-      subject: data.subject ?? null,
-      from_email: data.from ?? null,
-      to_email: data.to ?? null,
-      received_at: receivedAtIso,
-      snippet: data.snippet ?? null,
-      main_pdf_path: finalMainPdfPath ?? null,
-      body_text: bodyText,
-      body_type: bodyType,
-    };
-
-    const { error: msgErr } = await supabase
-      .from("messages")
-      .upsert(upsertPayload, { onConflict: "id" });
-
-    if (msgErr) console.error("Supabase upsert messages error:", msgErr);
-
-    // 3) message_attachments（mailのみ）: delete → insert
-    if (!isFax) {
-      const { error: delErr } = await supabase
-        .from("message_attachments")
-        .delete()
-        .eq("message_id", messageId);
-      if (delErr) console.error("Supabase delete message_attachments error:", delErr);
-
-      const rows = attachments.map((p) => ({
-        case_id: caseId,
-        message_id: messageId,
-        gcs_path: p,
-        file_name: typeof p === "string" ? p.split("/").pop() || null : null,
-        mime_type: null,
-      }));
-
-      if (rows.length) {
-        const { error: insErr } = await supabase
-          .from("message_attachments")
-          .insert(rows);
-        if (insErr) console.error("Supabase insert message_attachments error:", insErr);
+    if (!mainPdfPath && isFax && attachments.length > 0) {
+      const pdfAttachments = attachments.filter(
+        (p) => typeof p === "string" && p.toLowerCase().endsWith(".pdf")
+      );
+      if (pdfAttachments.length > 0) {
+        mainPdfPath = pdfAttachments[0];
       }
     }
 
-    // 4) message_main_pdf_files: delete → insert
-    const { error: delMainErr } = await supabase
-      .from("message_main_pdf_files")
-      .delete()
-      .eq("message_id", messageId);
-    if (delMainErr) console.error("Supabase delete message_main_pdf_files error:", delMainErr);
+    // ======================================================
+    // 1) cases: 案件（management_no 単位）
+    // ======================================================
+    let caseId = null;
 
-    if (finalMainPdfPath) {
+    {
+      const { data: existing, error: selectErr } = await supabase
+        .from("cases")
+        .select("id")
+        .eq("management_no", managementNo)
+        .maybeSingle();
+
+      if (selectErr) {
+        console.error("Supabase select cases error:", selectErr);
+        return;
+      }
+
+      if (existing) {
+        caseId = existing.id;
+
+        // 取引先・最新日時を更新しておく
+        const { error: updateErr } = await supabase
+          .from("cases")
+          .update({
+            customer_id: customerId,
+            customer_name: customerName,
+            latest_message_at: receivedAt.toISOString(),
+          })
+          .eq("id", caseId);
+
+        if (updateErr) {
+          console.error("Supabase update cases error:", updateErr);
+        }
+      } else {
+        const { data: inserted, error: insertErr } = await supabase
+          .from("cases")
+          .insert({
+            management_no: managementNo,
+            customer_id: customerId,
+            customer_name: customerName,
+            title: data.subject ?? null,
+            latest_message_at: receivedAt.toISOString(),
+          })
+          .select()
+          .single();
+
+        if (insertErr) {
+          console.error("Supabase insert cases error:", insertErr);
+          return;
+        }
+
+        caseId = inserted.id;
+      }
+    }
+
+    if (!caseId) {
+      console.error("caseId is null. Abort sync.");
+      return;
+    }
+
+    // ======================================================
+    // 2) messages: メール/FAX 1通（本文 & main_pdf_path を統一的に保存）
+    // ======================================================
+    {
+      const upsertPayload = {
+        id: messageId,
+        case_id: caseId,
+        message_type: data.messageType ?? null, // 'fax' or 'mail'
+        subject: data.subject ?? null,
+        from_email: data.from ?? null,
+        to_email: data.to ?? null,
+        received_at: receivedAt.toISOString(),
+        snippet: data.snippet ?? null,
+        main_pdf_path: mainPdfPath ?? null,
+      };
+
+      // ★ DB に body_text/body_type カラムを追加した場合のみセットする
+      //   （未追加ならここはコメントアウトか削除）
+      upsertPayload.body_text = bodyText;
+      upsertPayload.body_type = bodyType;
+
+      const { error: msgErr } = await supabase
+        .from("messages")
+        .upsert(upsertPayload, { onConflict: "id" });
+
+      if (msgErr) {
+        console.error("Supabase upsert messages error:", msgErr);
+      }
+    }
+
+    // ======================================================
+    // 3) message_attachments: 雑多な添付（mail のみ）
+    // ======================================================
+    if (!isFax && attachments.length > 0) {
+      const rows = attachments.map((path) => ({
+        case_id: caseId,
+        message_id: messageId,
+        gcs_path: path,
+        file_name:
+          typeof path === "string" ? path.split("/").pop() || null : null,
+        mime_type: null,
+      }));
+    
+      const { error: attErr } = await supabase
+        .from("message_attachments")
+        .insert(rows);
+    
+      if (attErr) {
+        console.error(
+          "Supabase insert message_attachments error:",
+          attErr
+        );
+      }
+    }
+
+
+    // ======================================================
+    // 4) message_main_pdf_files: メインPDF（mail & fax 共通）
+    //    - gcs_path: mainPdfPath
+    //    - thumbnail_path: mainPdfThumbnailPath
+    // ======================================================
+    if (mainPdfPath) {
       const row = {
         case_id: caseId,
         message_id: messageId,
-        gcs_path: finalMainPdfPath,
+        gcs_path: mainPdfPath,
         file_name:
-          typeof finalMainPdfPath === "string"
-            ? finalMainPdfPath.split("/").pop() || null
+          typeof mainPdfPath === "string"
+            ? mainPdfPath.split("/").pop() || null
             : null,
         mime_type: "application/pdf",
         file_type: isFax ? "fax_original" : "mail_rendered",
@@ -319,14 +223,23 @@ export async function mirrorMessageToSupabaseFull({
         .from("message_main_pdf_files")
         .insert(row);
 
-      if (mainErr) console.error("Supabase insert message_main_pdf_files error:", mainErr);
+      if (mainErr) {
+        console.error(
+          "Supabase insert message_main_pdf_files error:",
+          mainErr
+        );
+      }
     }
 
     console.log(
-      `✅ full sync OK messageId=${messageId} managementNo=${finalManagementNo} caseId=${caseId}`
+      `✅ Supabase sync OK messageId=${messageId} managementNo=${managementNo} caseId=${caseId}`
     );
   } catch (e) {
-    console.error("mirrorMessageToSupabaseFull exception:", e);
-    throw e;
+    console.error("mirrorMessageToSupabase exception:", e);
   }
+}
+
+// HTMLタグざっくり除去用の簡易関数
+function stripHtmlTags(html = "") {
+  return html.replace(/<[^>]*>/g, " ");
 }
