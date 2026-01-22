@@ -3,9 +3,8 @@ import vision from "@google-cloud/vision";
 import { Storage } from "@google-cloud/storage";
 import fs from "fs/promises";
 import puppeteer from "puppeteer";
-import { mirrorMessageToSupabase } from "./supabaseSync.js";
-
-import { Firestore } from "@google-cloud/firestore"; // ★ 追加
+import { Firestore } from "@google-cloud/firestore";
+import { mirrorMessageToSupabaseFull } from "./supabaseSync.js";
 
 // akiyama-system データベース（取引先マスタ用）
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
@@ -15,14 +14,13 @@ const customerDb = new Firestore(
     : { databaseId: "akiyama-system" }
 );
 
-
-// ====== Vision / Storage clients ======
+// Vision / Storage clients
 const client = new vision.ImageAnnotatorClient();
 const storage = new Storage();
 
 /**
  * MAIN ENTRY
- * index.js の saveMessageDoc() 直後に呼ばれる
+ * Cloud Tasks (/gmail/process) から呼ばれる想定
  */
 export async function runAfterProcess({ messageId, firestore, bucket }) {
   try {
@@ -34,23 +32,20 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
     const attachments = data.attachments || [];
     const isFax = data.messageType === "fax";
 
-     // === 0) OCR（テキストだけ取得）===
+    // === 0) OCR（FAXだけ）===
     let fullOcrText = "";
     if (isFax) {
       const r = await runOcr(attachments);
       fullOcrText = r.fullOcrText || "";
     }
 
-
-
-    // === 本文候補プール（顧客特定などに使用） ===
+    // 本文候補プール（顧客特定などに使用）
     const bodyPool = [
-      data.subject || "",     // ★ これ追加
+      data.subject || "",
       data.textPlain || "",
       data.textHtml || "",
       fullOcrText || "",
     ].join(" ");
-
 
     // === 1) 管理番号（毎回新規発番）===
     const managementNo = await ensureManagementNo7(firestore);
@@ -63,7 +58,7 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
 
     // === 2.5) メインPDF ===
     let mainPdfPath = null;
-    let mainPdfThumbnailPath = null; // サムネは使わないがフィールドは残す
+    let mainPdfThumbnailPath = null;
 
     if (bucket) {
       if (isFax) {
@@ -75,12 +70,10 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
           mainPdfPath = firstAttachment;
         }
       } else {
-        // ✉ メール → HTML → PDF（サムネ無し）
+        // ✉ メール → HTML → PDF
         const htmlSource =
           data.textHtml ||
-          (data.textPlain
-            ? `<pre>${String(data.textPlain)}</pre>`
-            : null);
+          (data.textPlain ? `<pre>${String(data.textPlain)}</pre>` : null);
 
         if (htmlSource) {
           try {
@@ -114,22 +107,18 @@ export async function runAfterProcess({ messageId, firestore, bucket }) {
       { merge: true }
     );
 
-    // === 4) Supabase ミラー ===
-    mirrorMessageToSupabase({
+    // === 4) Supabase 完成同期（必ず await）===
+    await mirrorMessageToSupabaseFull({
       messageId,
-      data: {
-        ...data,
-        ocr: { fullText: fullOcrText },
-        mainPdfPath,
-        mainPdfThumbnailPath,
-      },
+      firestore,
       managementNo,
       customer,
+      mainPdfPath,
+      mainPdfThumbnailPath,
+      fullOcrText,
     });
 
-    console.log(
-      `✅ afterProcess done id=${messageId} mgmt=${managementNo}`
-    );
+    console.log(`✅ afterProcess done id=${messageId} mgmt=${managementNo}`);
   } catch (e) {
     console.error("afterProcess error:", e);
   }
@@ -234,9 +223,7 @@ async function runOcr(attachments) {
     }
   }
 
-  return {
-    fullOcrText,
-  };
+  return { fullOcrText };
 }
 
 /* ================= 顧客特定 ================= */
@@ -251,10 +238,9 @@ async function detectCustomer(_firestore, sourceText) {
     console.log("Client Search exists?", snap.exists);
     if (!snap.exists) return null;
 
-    const doc = snap.data(); // { main: "...." } の形
+    const doc = snap.data(); // { main: "...." }
     console.log("Client Search root keys:", Object.keys(doc || {}));
 
-    // ★ main は string 型（JSON文字列）なので parse する
     let sheet = doc.main;
     if (typeof sheet === "string") {
       try {
@@ -264,9 +250,6 @@ async function detectCustomer(_firestore, sourceText) {
         return null;
       }
     }
-
-    // ここから先は、君がくれた JSON そのものを前提にする
-    // sheet = { type: "sheet", tables: [ { ..., matrix: [...] } ] }
 
     if (!sheet || typeof sheet !== "object") {
       console.log("Client Search: main is not object after parse:", sheet);
@@ -295,7 +278,6 @@ async function detectCustomer(_firestore, sourceText) {
     const colMailAliases = idx("mail_aliases");
     const colFaxAliases  = idx("fax_aliases");
     const colNameAliases = idx("name_aliases");
-    // kana は使わないので無視
 
     console.log("col indexes:", {
       colId,
@@ -339,7 +321,6 @@ async function detectCustomer(_firestore, sourceText) {
       return { id, name, mailAliases, faxAliases, nameAliases };
     });
 
-    // ① mail エイリアスに含むか（最優先）
     for (const r of rows) {
       for (const a of r.mailAliases) {
         const aNorm = normalize(a);
@@ -350,24 +331,16 @@ async function detectCustomer(_firestore, sourceText) {
       }
     }
 
-    // ② fax 番号エイリアス（数字だけでマッチ）
     for (const r of rows) {
       for (const a of r.faxAliases) {
         const aDigits = normalizeDigits(a);
         if (aDigits && textDigits.includes(aDigits)) {
-          console.log("match by FAX alias:", {
-            id: r.id,
-            name: r.name,
-            alias: a,
-            aDigits,
-            textDigits: textDigits.slice(0, 50),
-          });
+          console.log("match by FAX alias:", { id: r.id, name: r.name, alias: a });
           return { id: r.id, name: r.name };
         }
       }
     }
 
-    // ③ 名前エイリアス（name_aliases のみ）
     for (const r of rows) {
       for (const a of r.nameAliases) {
         const aNorm = normalize(a);
@@ -425,10 +398,8 @@ function parseGsUri(uri) {
   const m = uri?.match(/^gs:\/\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
 }
-
 function sanitizeId(id) {
   return String(id || "")
     .replace(/[^a-zA-Z0-9_-]/g, "_")
     .slice(0, 100);
 }
-
