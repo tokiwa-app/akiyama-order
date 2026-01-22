@@ -17,6 +17,6 @@
 
     "@supabase/supabase-js": "^2.0.0",
     "puppeteer": "^22.7.1",
-    "mailparser": "^3.x.x"
+    "mailparser": "^3.7.1"
   }
 }
