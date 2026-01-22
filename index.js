@@ -1,287 +1,307 @@
-// index.js
-import express from "express";
-import { google } from "googleapis";
-import { Firestore } from "@google-cloud/firestore";
-import { Storage } from "@google-cloud/storage";
-import path from "path";
-import { runAfterProcess } from "./afterProcess.js"; // ← 追加
+// supabaseSync.js
+import { supabase } from "./supabaseClient.js";
 
-// ==== 環境変数 ====
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || undefined;
-const GCS_BUCKET = process.env.GCS_BUCKET || "";
-const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
-const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
-const OAUTH_REDIRECT_URI =
-  process.env.OAUTH_REDIRECT_URI ||
-  "https://<YOUR_CLOUD_RUN_URL>/oauth2/callback";
-const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null;
-const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase();
-const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
-
-// ==== 初期化 ====
-const app = express();
-app.use(express.json());
-const db = new Firestore(
-  FIREBASE_PROJECT_ID ? { projectId: FIREBASE_PROJECT_ID } : {}
-);
-const storage = new Storage();
-const bucket = GCS_BUCKET ? storage.bucket(GCS_BUCKET) : null;
-
-// ==== ユーティリティ ====
-function b64UrlDecode(data) {
-  return Buffer.from(
-    (data || "").replace(/-/g, "+").replace(/_/g, "/"),
-    "base64"
-  ).toString("utf8");
+function stripHtmlTags(html = "") {
+  return html.replace(/<[^>]*>/g, " ");
 }
-function getHeader(headers, name) {
-  const h = (headers || []).find(
-    (x) => x.name?.toLowerCase() === name.toLowerCase()
-  );
-  return h?.value || "";
+
+function getReceivedAt(data) {
+  if (typeof data.internalDate === "number") return new Date(data.internalDate);
+  if (data.receivedAt?.toDate) return data.receivedAt.toDate();
+  if (data.receivedAt instanceof Date) return data.receivedAt;
+  return new Date();
 }
-function flattenParts(parts) {
-  const out = [];
-  const stack = [...(parts || [])];
-  while (stack.length) {
-    const p = stack.shift();
-    out.push(p);
-    if (p?.parts?.length) stack.push(...p.parts);
+
+async function getMessageDoc(firestore, messageId) {
+  const snap = await firestore.collection("messages").doc(messageId).get();
+  if (!snap.exists) return null;
+  return snap.data();
+}
+
+async function ensureCaseByManagementNo(managementNo, customerId, customerName, title, receivedAtIso) {
+  const { data: existing, error: selectErr } = await supabase
+    .from("cases")
+    .select("id, management_no")
+    .eq("management_no", managementNo)
+    .maybeSingle();
+
+  if (selectErr) throw selectErr;
+
+  if (existing) {
+    const { error: updateErr } = await supabase
+      .from("cases")
+      .update({
+        customer_id: customerId,
+        customer_name: customerName,
+        latest_message_at: receivedAtIso,
+        title: title ?? null,
+      })
+      .eq("id", existing.id);
+    if (updateErr) console.error("Supabase update cases error:", updateErr);
+    return existing.id;
   }
-  return out;
+
+  const { data: inserted, error: insertErr } = await supabase
+    .from("cases")
+    .insert({
+      management_no: managementNo,
+      customer_id: customerId,
+      customer_name: customerName,
+      title: title ?? null,
+      latest_message_at: receivedAtIso,
+    })
+    .select()
+    .single();
+
+  if (insertErr) throw insertErr;
+  return inserted.id;
 }
-function extractBodies(payload) {
-  let textPlain = "";
-  let textHtml = "";
-  if (!payload) return { textPlain, textHtml };
-  const parts = payload.parts ? flattenParts(payload.parts) : [payload];
-  for (const p of parts) {
-    if (p.mimeType === "text/plain" && p.body?.data)
-      textPlain += b64UrlDecode(p.body.data);
-    if (p.mimeType === "text/html" && p.body?.data)
-      textHtml += b64UrlDecode(p.body.data);
+
+async function migrateCaseManagementNo(oldManagementNo, newManagementNo) {
+  if (!oldManagementNo || !newManagementNo || oldManagementNo === newManagementNo) return;
+
+  // 旧management_noのcaseを探す
+  const { data: oldCase, error: oldErr } = await supabase
+    .from("cases")
+    .select("id, management_no")
+    .eq("management_no", oldManagementNo)
+    .maybeSingle();
+
+  if (oldErr) {
+    console.error("Supabase select old case error:", oldErr);
+    return;
   }
-  return { textPlain, textHtml };
-}
-function safeFilename(name) {
-  const base = path.posix.basename(name || "attachment");
-  return encodeURIComponent(base.replace(/[\u0000-\u001F\u007F/\\]/g, "_"));
-}
+  if (!oldCase) return;
 
-// ==== OAuth 関連 ====
-let cachedRefreshToken = OAUTH_REFRESH_TOKEN;
-async function getStoredRefreshToken() {
-  if (cachedRefreshToken) return cachedRefreshToken;
-  const doc = await db.collection("system").doc("gmail_oauth").get();
-  const tok = doc.exists ? doc.data()?.refresh_token : null;
-  if (tok) cachedRefreshToken = tok;
-  return cachedRefreshToken;
-}
-async function storeRefreshToken(token) {
-  cachedRefreshToken = token || cachedRefreshToken;
-  if (!token) return;
-  await db
-    .collection("system")
-    .doc("gmail_oauth")
-    .set({ refresh_token: token, updatedAt: Date.now() }, { merge: true });
-}
+  // すでに newManagementNo の case があるなら移行しない（衝突回避）
+  const { data: newCase, error: newErr } = await supabase
+    .from("cases")
+    .select("id")
+    .eq("management_no", newManagementNo)
+    .maybeSingle();
 
-async function getGmail() {
-  const refresh = await getStoredRefreshToken();
-  if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && refresh) {
-    const oAuth2 = new google.auth.OAuth2(
-      OAUTH_CLIENT_ID,
-      OAUTH_CLIENT_SECRET,
-      OAUTH_REDIRECT_URI
-    );
-    oAuth2.setCredentials({ refresh_token: refresh });
-    return google.gmail({ version: "v1", auth: oAuth2 });
+  if (newErr) {
+    console.error("Supabase select new case error:", newErr);
+    return;
   }
-  throw new Error("No OAuth refresh token available.");
+  if (newCase) return;
+
+  const { error: updErr } = await supabase
+    .from("cases")
+    .update({ management_no: newManagementNo })
+    .eq("id", oldCase.id);
+
+  if (updErr) console.error("Supabase migrate case management_no error:", updErr);
 }
 
-// ==== 添付保存 ====
-async function saveAttachmentToGCS(userEmail, messageId, part) {
-  if (!bucket) return null;
-  const attachId = part?.body?.attachmentId;
-  if (!attachId) return null;
-  const gmail = await getGmail();
-  const res = await gmail.users.messages.attachments.get({
-    userId: "me",
-    messageId,
-    id: attachId,
-  });
-  const b64 = (res.data.data || "").replace(/-/g, "+").replace(/_/g, "/");
-  const bytes = Buffer.from(b64, "base64");
-  const filename = safeFilename(part.filename || `attachment-${attachId}`);
-  const objectPath = `gmail/${encodeURIComponent(
-    userEmail
-  )}/${messageId}/${filename}`;
-  await bucket.file(objectPath).save(bytes, {
-    resumable: false,
-    metadata: { contentType: part.mimeType || "application/octet-stream" },
-  });
-  return `gs://${GCS_BUCKET}/${objectPath}`;
-}
-
-// ==== メッセージ保存 ====
-async function saveMessageDoc(emailAddress, m) {
-  const payload = m.data.payload;
-  const headers = payload?.headers || [];
-  const subject = getHeader(headers, "Subject");
-  const from = getHeader(headers, "From");
-  const to = getHeader(headers, "To");
-  const cc = getHeader(headers, "Cc");
-  const dateHdr = getHeader(headers, "Date");
-  const internalDateMs = m.data.internalDate
-    ? Number(m.data.internalDate)
-    : Date.parse(dateHdr);
-  const { textPlain, textHtml } = extractBodies(payload);
-
-  const addrMatch = (from || "").match(/<([^>]+)>/);
-  const fromEmail = (addrMatch ? addrMatch[1] : (from || ""))
-    .trim()
-    .toLowerCase();
-  const messageType =
-    FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
-
-  const attachments = [];
-  const parts = flattenParts(payload?.parts || []);
-  for (const p of parts) {
-    if (p?.filename && p.body?.attachmentId) {
-      const path = await saveAttachmentToGCS(emailAddress, m.data.id, p);
-      if (path) attachments.push(path);
+/**
+ * ✅ afterProcess不要の「最低限同期」
+ * - cases.management_no は一旦 messageId を使う（仮case）
+ * - messages は upsert
+ * - 添付/PDF はここでは触らない（後で full がやる）
+ */
+export async function mirrorMessageToSupabaseBasic({ messageId, firestore }) {
+  try {
+    if (!supabase) {
+      console.error("Supabase client is not initialized.");
+      return;
     }
-  }
 
-  await db
-    .collection("messages")
-    .doc(m.data.id)
-    .set(
-      {
-        user: emailAddress,
-        threadId: m.data.threadId,
-        internalDate: internalDateMs || null,
-        receivedAt: internalDateMs ? new Date(internalDateMs) : new Date(),
-        from,
-        to,
-        cc,
-        subject,
-        snippet: m.data.snippet || "",
-        textPlain,
-        textHtml,
-        labels: m.data.labelIds || [],
-        attachments,
-        gcsBucket: GCS_BUCKET || null,
-        messageType,
-        updatedAt: Date.now(),
-        createdAt: Date.now(),
-      },
-      { merge: true }
+    const data = await getMessageDoc(firestore, messageId);
+    if (!data) return;
+
+    const receivedAt = getReceivedAt(data);
+    const receivedAtIso = receivedAt.toISOString();
+
+    const isFax = data.messageType === "fax";
+    const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+
+    // 本文（mail: plain優先 / fax: snippetのみ）
+    let bodyText = "";
+    let bodyType = "basic";
+    if (!isFax) {
+      if (data.textPlain) bodyText = data.textPlain;
+      else if (data.textHtml) bodyText = stripHtmlTags(data.textHtml);
+      else bodyText = "";
+      bodyType = "mail_raw";
+    } else {
+      bodyText = data.snippet ?? "";
+      bodyType = "fax_basic";
+    }
+
+    // 仮 managementNo（caseを作るため）
+    const tempManagementNo = messageId;
+
+    console.log("🧩 basic sync start", { messageId, tempManagementNo, messageType: data.messageType });
+
+    const customerId = data.customerId ?? null;
+    const customerName = data.customerName ?? null;
+
+    // 1) cases（仮）
+    const caseId = await ensureCaseByManagementNo(
+      tempManagementNo,
+      customerId,
+      customerName,
+      data.subject ?? null,
+      receivedAtIso
     );
 
-  // ✅ ここで後処理呼び出し
-  await runAfterProcess({ messageId: m.data.id, firestore: db, bucket });
+    // 2) messages（upsert）
+    const upsertPayload = {
+      id: messageId,
+      case_id: caseId,
+      message_type: data.messageType ?? null,
+      subject: data.subject ?? null,
+      from_email: data.from ?? null,
+      to_email: data.to ?? null,
+      received_at: receivedAtIso,
+      snippet: data.snippet ?? null,
+      main_pdf_path: null,
+      body_text: bodyText,
+      body_type: bodyType,
+    };
+
+    const { error: msgErr } = await supabase.from("messages").upsert(upsertPayload, { onConflict: "id" });
+    if (msgErr) console.error("Supabase upsert messages error:", msgErr);
+
+    // 3) 添付は full 側に任せる（重複・整合を full に集約）
+    console.log(`✅ basic sync OK messageId=${messageId} caseId=${caseId} tempManagementNo=${tempManagementNo} attachments=${attachments.length}`);
+  } catch (e) {
+    console.error("mirrorMessageToSupabaseBasic exception:", e);
+    throw e;
+  }
 }
 
-// ==== ルーティング ====
-app.get("/", (_req, res) => res.status(200).send("ok"));
-
-app.get("/oauth2/start", async (_req, res) => {
+/**
+ * ✅ afterProcess成功後の「完成同期」
+ * - 仮case (management_no=messageId) を本物 managementNo に移行
+ * - cases/messages/main_pdf/attachments を整合させる
+ * - 添付/PDF は delete→insert で冪等化
+ */
+export async function mirrorMessageToSupabaseFull({
+  messageId,
+  firestore,
+  managementNo,
+  customer,
+  mainPdfPath,
+  mainPdfThumbnailPath,
+  fullOcrText,
+}) {
   try {
-    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
-      return res.status(400).send("OAuth client not set");
-    const oAuth2 = new google.auth.OAuth2(
-      OAUTH_CLIENT_ID,
-      OAUTH_CLIENT_SECRET,
-      OAUTH_REDIRECT_URI
+    if (!supabase) {
+      console.error("Supabase client is not initialized.");
+      return;
+    }
+
+    const data = await getMessageDoc(firestore, messageId);
+    if (!data) return;
+
+    const receivedAt = getReceivedAt(data);
+    const receivedAtIso = receivedAt.toISOString();
+    const isFax = data.messageType === "fax";
+    const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+
+    const customerId = customer?.id ?? data.customerId ?? null;
+    const customerName = customer?.name ?? data.customerName ?? null;
+
+    // 本文（mail: raw / fax: OCR）
+    let bodyText = "";
+    let bodyType = "";
+    if (isFax) {
+      bodyText = fullOcrText ?? data.ocr?.fullText ?? "";
+      bodyType = "fax_ocr";
+    } else {
+      if (data.textPlain) bodyText = data.textPlain;
+      else if (data.textHtml) bodyText = stripHtmlTags(data.textHtml);
+      else bodyText = "";
+      bodyType = "mail_raw";
+    }
+
+    const finalManagementNo = managementNo || data.managementNo;
+    if (!finalManagementNo) {
+      console.warn("full sync skipped: managementNo missing", { messageId });
+      return;
+    }
+
+    console.log("🔁 full sync start", { messageId, finalManagementNo, messageType: data.messageType });
+
+    // 0) 仮case (management_no=messageId) を本物に移行（可能なら）
+    await migrateCaseManagementNo(messageId, finalManagementNo);
+
+    // 1) cases（本物managementNoで ensure）
+    const caseId = await ensureCaseByManagementNo(
+      finalManagementNo,
+      customerId,
+      customerName,
+      data.subject ?? null,
+      receivedAtIso
     );
-    const url = oAuth2.generateAuthUrl({
-      access_type: "offline",
-      prompt: "consent",
-      scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-    });
-    res.redirect(url);
-  } catch (e) {
-    res.status(500).send("oauth start error");
-  }
-});
 
-app.get("/oauth2/callback", async (req, res) => {
-  try {
-    if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET)
-      return res.status(400).send("OAuth client not set");
-    const code = req.query?.code;
-    if (!code) return res.status(400).send("missing code");
-    const oAuth2 = new google.auth.OAuth2(
-      OAUTH_CLIENT_ID,
-      OAUTH_CLIENT_SECRET,
-      OAUTH_REDIRECT_URI
-    );
-    const { tokens } = await oAuth2.getToken(code);
-    if (tokens.refresh_token) await storeRefreshToken(tokens.refresh_token);
-    res.status(200).send("linked");
-  } catch (e) {
-    res.status(500).send("oauth callback error");
-  }
-});
+    // 2) messages（upsertで完成形）
+    const upsertPayload = {
+      id: messageId,
+      case_id: caseId,
+      message_type: data.messageType ?? null,
+      subject: data.subject ?? null,
+      from_email: data.from ?? null,
+      to_email: data.to ?? null,
+      received_at: receivedAtIso,
+      snippet: data.snippet ?? null,
+      main_pdf_path: mainPdfPath ?? data.mainPdfPath ?? data.main_pdf_path ?? null,
+      body_text: bodyText,
+      body_type: bodyType,
+    };
 
-app.post("/gmail/poll", async (req, res) => {
-  const started = Date.now();
-  try {
-    const gmail = await getGmail();
-    const profile = await gmail.users.getProfile({ userId: "me" });
-    const emailAddress = profile.data.emailAddress || "me";
-    const minutesParam = Number(req.query?.minutes || LOOKBACK_MINUTES);
-    const minutes =
-      Number.isFinite(minutesParam) && minutesParam > 0
-        ? Math.floor(minutesParam)
-        : LOOKBACK_MINUTES;
+    const { error: msgErr } = await supabase.from("messages").upsert(upsertPayload, { onConflict: "id" });
+    if (msgErr) console.error("Supabase upsert messages error:", msgErr);
 
-    const cutoffEpoch = Math.floor((Date.now() - minutes * 60 * 1000) / 1000);
-    const q = `after:${cutoffEpoch} in:inbox`;
+    // 3) message_attachments（mailのみ）: delete → insert
+    if (!isFax) {
+      const { error: delErr } = await supabase.from("message_attachments").delete().eq("message_id", messageId);
+      if (delErr) console.error("Supabase delete message_attachments error:", delErr);
 
-    let pageToken;
-    let newCount = 0;
-    let seen = 0;
+      const attRows = (attachments || []).map((p) => ({
+        case_id: caseId,
+        message_id: messageId,
+        gcs_path: p,
+        file_name: typeof p === "string" ? p.split("/").pop() || null : null,
+        mime_type: null,
+      }));
 
-    do {
-      const list = await gmail.users.messages.list({
-        userId: "me",
-        q,
-        pageToken,
-        maxResults: 200,
-      });
-      pageToken = list.data.nextPageToken || null;
-      const ids = (list.data.messages || []).map((m) => m.id);
-      if (!ids.length) break;
-
-      for (const id of ids) {
-        seen++;
-        const doc = await db.collection("messages").doc(id).get();
-        if (doc.exists) continue;
-        const full = await gmail.users.messages.get({
-          userId: "me",
-          id,
-          format: "full",
-        });
-        await saveMessageDoc(emailAddress, full);
-        newCount++;
+      if (attRows.length > 0) {
+        const { error: insErr } = await supabase.from("message_attachments").insert(attRows);
+        if (insErr) console.error("Supabase insert message_attachments error:", insErr);
       }
-    } while (pageToken);
+    }
 
-    const ms = Date.now() - started;
-    res
-      .status(200)
-      .send(`OK processed=${seen} new=${newCount} minutes=${minutes} in ${ms}ms`);
+    // 4) message_main_pdf_files（mail & fax）: delete → insert
+    const { error: delMainErr } = await supabase.from("message_main_pdf_files").delete().eq("message_id", messageId);
+    if (delMainErr) console.error("Supabase delete message_main_pdf_files error:", delMainErr);
+
+    const finalMainPdfPath =
+      mainPdfPath ?? data.mainPdfPath ?? data.main_pdf_path ?? null;
+
+    if (finalMainPdfPath) {
+      const row = {
+        case_id: caseId,
+        message_id: messageId,
+        gcs_path: finalMainPdfPath,
+        file_name:
+          typeof finalMainPdfPath === "string"
+            ? finalMainPdfPath.split("/").pop() || null
+            : null,
+        mime_type: "application/pdf",
+        file_type: isFax ? "fax_original" : "mail_rendered",
+        thumbnail_path: mainPdfThumbnailPath ?? null,
+      };
+
+      const { error: mainErr } = await supabase.from("message_main_pdf_files").insert(row);
+      if (mainErr) console.error("Supabase insert message_main_pdf_files error:", mainErr);
+    }
+
+    console.log(`✅ full sync OK messageId=${messageId} managementNo=${finalManagementNo} caseId=${caseId}`);
   } catch (e) {
-    console.error("/gmail/poll error:", e);
-    res.status(200).send("OK (partial or error logged)");
+    console.error("mirrorMessageToSupabaseFull exception:", e);
+    throw e;
   }
-});
-
-// ==== 起動 ====
-const port = process.env.PORT || 8080;
-app.listen(port, "0.0.0.0", () => {
-  console.log(`listening on ${port}`);
-});
+}
