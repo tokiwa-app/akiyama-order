@@ -9,7 +9,53 @@
  *
  * 変更点:
  * - mailのHTMLを捨てない: messages.body_html に保存する
+ *
+ * ★最小変更（今回追加）:
+ * - body_html が空になる原因（text/html が body.data ではなく body.attachmentId で来る）に対応
+ * - text/plain / text/html で body.data が無いときは attachments.get で回収する
  */
+
+// b64url decode（index.js と同等。depsを増やさないため ingest.js 内に最小追加）
+function b64UrlDecode(data) {
+  return Buffer.from((data || "").replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+}
+
+// ★本文(text/plain, text/html)を “attachmentId でも” 取る（最小追加）
+async function extractBodiesAsync({ gmail, messageId, payload, flattenParts }) {
+  let textPlain = "";
+  let textHtml = "";
+  if (!payload) return { textPlain, textHtml };
+
+  const parts = payload.parts ? flattenParts(payload.parts) : [payload];
+
+  async function readPartBody(p) {
+    // まず body.data があればそれを使う（従来通り）
+    if (p?.body?.data) return b64UrlDecode(p.body.data);
+
+    // data が無く attachmentId の場合（ここが今回の要点）
+    const attachId = p?.body?.attachmentId;
+    if (!attachId) return "";
+
+    const res = await gmail.users.messages.attachments.get({
+      userId: "me",
+      messageId,
+      id: attachId,
+    });
+
+    const data = res?.data?.data || "";
+    if (!data) return "";
+    return b64UrlDecode(data);
+  }
+
+  for (const p of parts) {
+    const mt = (p?.mimeType || "").toLowerCase();
+    if (mt === "text/plain") textPlain += await readPartBody(p);
+    if (mt === "text/html") textHtml += await readPartBody(p);
+  }
+
+  return { textPlain, textHtml };
+}
+
 export function registerIngestRoutes(app, deps) {
   const {
     FAX_SENDER,
@@ -18,7 +64,7 @@ export function registerIngestRoutes(app, deps) {
     getGmail,
     getHeader,
     flattenParts,
-    extractBodies,
+    // extractBodies, // ★使わない（attachmentId対応の async を使う）
     saveAttachmentToGCS,
     upsertCaseByManagementNo,
   } = deps;
@@ -77,7 +123,13 @@ export function registerIngestRoutes(app, deps) {
           const receivedAt = internalDateMs ? new Date(internalDateMs) : new Date();
           const receivedAtIso = receivedAt.toISOString();
 
-          const { textPlain, textHtml } = extractBodies(payload);
+          // ★ここだけ最小変更：本文抽出を async 版へ（attachmentId の本文も回収）
+          const { textPlain, textHtml } = await extractBodiesAsync({
+            gmail,
+            messageId: id,
+            payload,
+            flattenParts,
+          });
 
           const addrMatch = (from || "").match(/<([^>]+)>/);
           const fromEmail = (addrMatch ? addrMatch[1] : (from || "")).trim().toLowerCase();
@@ -88,8 +140,8 @@ export function registerIngestRoutes(app, deps) {
 
           const caseId = await upsertCaseByManagementNo(
             managementNo,
-            null,
-            null,
+            0, // ★未特定は 0
+            "未設定", // ★未設定表示
             subject ?? null,
             receivedAtIso
           );
@@ -109,9 +161,9 @@ export function registerIngestRoutes(app, deps) {
               snippet: full.data.snippet ?? null,
               main_pdf_path: null,
 
-              // ★変更点：mailのHTMLを捨てない
-              // - plainは body_text
-              // - htmlは body_html
+              // mail:
+              // - plain は body_text
+              // - html は body_html
               body_text: textPlain || "",
               body_html: textHtml || null,
 
@@ -119,6 +171,10 @@ export function registerIngestRoutes(app, deps) {
               processed_at: null,
               processing_at: null,
               ocr_status: "pending",
+
+              // 顧客は後段で特定するが、初期値を入れたいならここで
+              customer_id: 0,
+              customer_name: "未設定",
             });
 
           if (insMsgErr) throw insMsgErr;
