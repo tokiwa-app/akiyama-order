@@ -285,6 +285,19 @@ async function upsertCaseByManagementNo(managementNo, customerId, customerName, 
     .single();
 
   if (insErr) throw insErr;
+  
+  // untriaged を付ける（case_flag_links）
+  const { error: flagErr } = await supabase
+    .from("case_flag_links")
+    .upsert(
+      { case_id: inserted.id, flag_code: "untriaged" },
+      { onConflict: "case_id,flag_code" }
+    );
+
+  if (flagErr) throw flagErr;
+
+
+  
   return inserted.id;
 }
 
