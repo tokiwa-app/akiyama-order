@@ -280,31 +280,43 @@ async function upsertCaseByManagementNo(managementNo, customerId, customerName, 
       customer_name: customerName,
       title: title ?? null,
       latest_message_at: receivedAtIso,
+      assignee_id: 4,
     })
     .select()
     .single();
 
   if (insErr) throw insErr;
 
-  // ★追加：登録直後に main_case_id = 自分(id)
-  const { error: mainErr } = await supabase
-    .from("cases")
-    .update({ main_case_id: inserted.id })
-    .eq("id", inserted.id);  
-  
-  // untriaged を付ける（case_flag_links）
-  const { error: flagErr } = await supabase
-    .from("case_flag_links")
-    .upsert(
-      { case_id: inserted.id, flag_code: "untriaged" },
-      { onConflict: "case_id,flag_code" }
-    );
+// ★追加：登録直後に main_case_id = 自分(id)
+const { error: mainErr } = await supabase
+  .from("cases")
+  .update({ main_case_id: inserted.id })
+  .eq("id", inserted.id);
 
-  if (flagErr) throw flagErr;
+if (mainErr) throw mainErr;
 
+// untriaged を付ける（case_flag_links）
+const { error: flagErr } = await supabase
+  .from("case_flag_links")
+  .upsert(
+    { case_id: inserted.id, flag_code: "untriaged" },
+    { onConflict: "case_id,flag_code" }
+  );
 
-  
-  return inserted.id;
+if (flagErr) throw flagErr;
+
+// ★ confirm を付ける（進捗タグ）
+const { error: tagErr } = await supabase
+  .from("case_tag_links")
+  .upsert(
+    { case_id: inserted.id, tag_code: "confirm" },
+    { onConflict: "case_id,tag_code" }
+  );
+
+if (tagErr) throw tagErr;
+
+return inserted.id;
+
 }
 
 // ================== ROUTES ==================
