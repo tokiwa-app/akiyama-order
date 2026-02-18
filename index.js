@@ -285,6 +285,12 @@ async function upsertCaseByManagementNo(managementNo, customerId, customerName, 
     .single();
 
   if (insErr) throw insErr;
+
+  // ★追加：登録直後に main_case_id = 自分(id)
+  const { error: mainErr } = await supabase
+    .from("cases")
+    .update({ main_case_id: inserted.id })
+    .eq("id", inserted.id);  
   
   // untriaged を付ける（case_flag_links）
   const { error: flagErr } = await supabase
