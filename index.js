@@ -280,7 +280,6 @@ async function upsertCaseByManagementNo(managementNo, customerId, customerName, 
       customer_name: customerName,
       title: title ?? null,
       latest_message_at: receivedAtIso,
-      assignee_id: 4,
     })
     .select()
     .single();
@@ -304,6 +303,16 @@ const { error: flagErr } = await supabase
   );
 
 if (flagErr) throw flagErr;
+
+  // ★ 本社(id=4) を担当として付与（case_assignees）
+const { error: asgErr } = await supabase
+  .from("case_assignees")
+  .upsert(
+    { case_id: inserted.id, assignee_id: 4, role: "main" },
+    { onConflict: "case_id,assignee_id,role" }
+  );
+
+if (asgErr) throw asgErr;
 
 // ★ confirm を付ける（進捗タグ）
 const { error: tagErr } = await supabase
