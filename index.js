@@ -304,13 +304,13 @@ const { error: flagErr } = await supabase
 
 if (flagErr) throw flagErr;
 
-  // ★ 本社(id=4) を担当として付与（case_assignees）
+// ★ 本社(id=4) を担当として付与（case_assignees）
 const { error: asgErr } = await supabase
   .from("case_assignees")
-  .upsert(
-    { case_id: inserted.id, assignee_id: 4, role: "main" },
-    { onConflict: "case_id,assignee_id,role" }
-  );
+  .insert({ case_id: inserted.id, assignee_id: 4, role: "main" });
+
+if (asgErr) throw asgErr;
+
 
 if (asgErr) throw asgErr;
 
