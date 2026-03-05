@@ -135,6 +135,7 @@ export function registerIngestRoutes(app, deps) {
             .insert({
               id,
               case_id: caseId,
+              previous_case_id: caseId, 
               message_type: messageType,
               subject: subject ?? null,
               from_email: from ?? null,
