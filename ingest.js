@@ -157,6 +157,19 @@ export function registerIngestRoutes(app, deps) {
             });
 
           if (insMsgErr) throw insMsgErr;
+          
+          // message_tag_links に uncategorized を付ける
+          const { error: msgTagErr } = await supabase
+            .from("message_tag_links")
+            .upsert(
+              {
+                message_id: id,
+                tag_code: "uncategorized",
+              },
+              { onConflict: "message_id,tag_code" }
+            );
+
+if (msgTagErr) throw msgTagErr;          
 
           // 3) 添付保存（既存ロジックそのまま：GCS）
           const attachments = [];
