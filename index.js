@@ -294,35 +294,16 @@ const { error: mainErr } = await supabase
 
 if (mainErr) throw mainErr;
 
-// untriaged を付ける（case_flag_links）
-const { error: flagErr } = await supabase
-  .from("case_flag_links")
-  .upsert(
-    { case_id: inserted.id, flag_code: "untriaged" },
-    { onConflict: "case_id,flag_code" }
-  );
 
-if (flagErr) throw flagErr;
+  // フラグ code=0 を付ける
+  const { error: flagErr } = await supabase
+    .from("case_flag_links")
+    .upsert(
+      { case_id: inserted.id, flag_code: "0" },
+      { onConflict: "case_id,flag_code" }
+    );
 
-// ★ 本社(id=4) を担当として付与（case_assignees）
-const { error: asgErr } = await supabase
-  .from("case_assignees")
-  .insert({ case_id: inserted.id, assignee_id: 4, role: "main" });
-
-if (asgErr) throw asgErr;
-
-
-if (asgErr) throw asgErr;
-
-// ★ confirm を付ける（進捗タグ）
-const { error: tagErr } = await supabase
-  .from("case_tag_links")
-  .upsert(
-    { case_id: inserted.id, tag_code: "confirm" },
-    { onConflict: "case_id,tag_code" }
-  );
-
-if (tagErr) throw tagErr;
+  if (flagErr) throw flagErr;
 
 return inserted.id;
 
