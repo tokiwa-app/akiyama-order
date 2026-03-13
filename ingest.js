@@ -120,11 +120,11 @@ export function registerIngestRoutes(app, deps) {
           // ★ここがポイント：HTMLメールなら parsed.html、無いなら parsed.textAsHtml
           const bodyHtml = parsed.html || parsed.textAsHtml || null;
 
-          // cases 先に作る（未特定は 0 / 未設定）
+          // cases 先に作る（未特定は 0 / 解析中）
           const caseId = await upsertCaseByManagementNo(
             managementNo,
             0,
-            "未設定",
+            "解析中",
             subject ?? null,
             receivedAtIso
           );
@@ -153,7 +153,7 @@ export function registerIngestRoutes(app, deps) {
               ocr_status: "pending",
 
               customer_id: 0,
-              customer_name: "未設定",
+              customer_name: "解析中",
             });
 
           if (insMsgErr) throw insMsgErr;
