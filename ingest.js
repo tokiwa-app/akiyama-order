@@ -11,6 +11,10 @@
  * これで:
  * - body_html が空になりがちな問題（attachmentId化）を気にしなくて済む
  * - text/html が無いメールでも textAsHtml が作られるので PDF化もしやすい
+ *
+ * 追加仕様:
+ * - 既存 message は通常スキップ
+ * - ただし fax で main_pdf_path が null のものは、次の poll でも再取得を試みる
  */
 
 import { simpleParser } from "mailparser";
@@ -67,14 +71,22 @@ export function registerIngestRoutes(app, deps) {
         for (const id of ids) {
           seen++;
 
-          // 既存ならスキップ
+          // 既存 message を確認
           const { data: existsRow, error: exErr } = await supabase
             .from("messages")
-            .select("id")
+            .select("id, case_id, message_type, main_pdf_path")
             .eq("id", id)
             .maybeSingle();
+
           if (exErr) throw exErr;
-          if (existsRow) continue;
+
+          const shouldRepairFax =
+            !!existsRow &&
+            existsRow.message_type === "fax" &&
+            !existsRow.main_pdf_path;
+
+          // 既存で、fax補修対象でなければスキップ
+          if (existsRow && !shouldRepairFax) continue;
 
           // 1) full（ヘッダ/添付探索用）
           const full = await gmail.users.messages.get({
@@ -117,59 +129,61 @@ export function registerIngestRoutes(app, deps) {
           const parsed = await simpleParser(emlBuf);
 
           const bodyText = parsed.text || "";
-          // ★ここがポイント：HTMLメールなら parsed.html、無いなら parsed.textAsHtml
           const bodyHtml = parsed.html || parsed.textAsHtml || null;
 
-          // cases 先に作る（未特定は 0 / 解析中）
-          const caseId = await upsertCaseByManagementNo(
-            managementNo,
-            0,
-            "解析中",
-            subject ?? null,
-            receivedAtIso
-          );
+          // 既存なら既存 case_id を使う。新規なら cases を作る
+          const caseId = existsRow?.case_id
+            ? existsRow.case_id
+            : await upsertCaseByManagementNo(
+                managementNo,
+                0,
+                "解析中",
+                subject ?? null,
+                receivedAtIso
+              );
 
-          // messages insert（case_id必須）
-          const { error: insMsgErr } = await supabase
-            .from("messages")
-            .insert({
-              id,
-              case_id: caseId,
-              previous_case_id: caseId, 
-              message_type: messageType,
-              subject: subject ?? null,
-              from_email: from ?? null,
-              to_email: to ?? null,
-              received_at: receivedAtIso,
-              snippet: full.data.snippet ?? null,
-              main_pdf_path: null,
+          // 新規 message のときだけ insert
+          if (!existsRow) {
+            const { error: insMsgErr } = await supabase
+              .from("messages")
+              .insert({
+                id,
+                case_id: caseId,
+                previous_case_id: caseId,
+                message_type: messageType,
+                subject: subject ?? null,
+                from_email: from ?? null,
+                to_email: to ?? null,
+                received_at: receivedAtIso,
+                snippet: full.data.snippet ?? null,
+                main_pdf_path: null,
 
-              body_text: bodyText,
-              body_html: bodyHtml,
+                body_text: bodyText,
+                body_html: bodyHtml,
 
-              body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
-              processed_at: null,
-              processing_at: null,
-              ocr_status: "pending",
+                body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
+                processed_at: null,
+                processing_at: null,
+                ocr_status: "pending",
 
-              customer_id: 0,
-              customer_name: "解析中",
-            });
+                customer_id: 0,
+                customer_name: "解析中",
+              });
 
-          if (insMsgErr) throw insMsgErr;
-          
-          // message_tag_links に uncategorized を付ける
-          const { error: msgTagErr } = await supabase
-            .from("message_tag_links")
-            .upsert(
-              {
-                message_id: id,
-                tag_code: "uncategorized",
-              },
-              { onConflict: "message_id,tag_code" }
-            );
+            if (insMsgErr) throw insMsgErr;
 
-if (msgTagErr) throw msgTagErr;          
+            const { error: msgTagErr } = await supabase
+              .from("message_tag_links")
+              .upsert(
+                {
+                  message_id: id,
+                  tag_code: "uncategorized",
+                },
+                { onConflict: "message_id,tag_code" }
+              );
+
+            if (msgTagErr) throw msgTagErr;
+          }
 
           // 3) 添付保存（既存ロジックそのまま：GCS）
           const attachments = [];
@@ -182,7 +196,7 @@ if (msgTagErr) throw msgTagErr;
           }
 
           if (messageType === "mail") {
-            if (attachments.length > 0) {
+            if (!existsRow && attachments.length > 0) {
               const rows = attachments.map((p) => ({
                 case_id: caseId,
                 message_id: id,
@@ -204,10 +218,12 @@ if (msgTagErr) throw msgTagErr;
             const mainPdfPath = pdf || any || null;
 
             if (mainPdfPath) {
-              await supabase
+              const { error: updErr } = await supabase
                 .from("messages")
                 .update({ main_pdf_path: mainPdfPath })
                 .eq("id", id);
+
+              if (updErr) throw updErr;
 
               const row = {
                 case_id: caseId,
@@ -221,10 +237,22 @@ if (msgTagErr) throw msgTagErr;
                 file_type: "fax_original",
                 thumbnail_path: null,
               };
-              const { error: mainErr } = await supabase
-                .from("message_main_pdf_files")
-                .insert(row);
-              if (mainErr) console.error("insert message_main_pdf_files error:", mainErr);
+
+              if (!existsRow) {
+                const { error: mainErr } = await supabase
+                  .from("message_main_pdf_files")
+                  .insert(row);
+                if (mainErr) {
+                  console.error("insert message_main_pdf_files error:", mainErr);
+                }
+              } else {
+                const { error: mainErr } = await supabase
+                  .from("message_main_pdf_files")
+                  .upsert(row, { onConflict: "message_id" });
+                if (mainErr) {
+                  console.error("upsert message_main_pdf_files error:", mainErr);
+                }
+              }
             }
           }
 
