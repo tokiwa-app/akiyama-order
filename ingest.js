@@ -164,7 +164,6 @@ export function registerIngestRoutes(app, deps) {
                 body_type: messageType === "fax" ? "fax_raw" : "mail_raw",
                 processed_at: null,
                 processing_at: null,
-                ocr_status: "pending",
 
                 customer_id: 0,
                 customer_name: "解析中",
