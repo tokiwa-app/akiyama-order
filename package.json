@@ -11,10 +11,7 @@
     "googleapis": "^133.0.0",
     "@google-cloud/firestore": "^7.10.0",
     "@google-cloud/storage": "^7.12.1",
-    "@google-cloud/vision": "^4.3.3",
 
     "@supabase/supabase-js": "^2.0.0",
-    "puppeteer": "^22.7.1",
-    "mailparser": "^3.7.1"
   }
 }
