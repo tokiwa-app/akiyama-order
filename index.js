@@ -8,7 +8,6 @@ import { Firestore } from "@google-cloud/firestore";
 import { supabase } from "./supabaseClient.js";
 
 import { registerIngestRoutes } from "./ingest.js";
-import { registerProcessBatchRoutes } from "./processBatch.js";
 
 // ================== ENV ==================
 const GCS_BUCKET = process.env.GCS_BUCKET || "";
@@ -337,7 +336,6 @@ const deps = {
 };
 
 registerIngestRoutes(app, deps);
-registerProcessBatchRoutes(app, deps);
 
 // ================== START ==================
 const port = process.env.PORT || 8080;
