@@ -15,7 +15,7 @@ const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || "";
 const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null;
 
 const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase();
-const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
+const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 1200);
 
 // ================== INIT ==================
 const app = express();
