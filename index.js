@@ -14,7 +14,12 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || "";
 const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || null;
 
-const FAX_SENDER = (process.env.FAX_SENDER || "").toLowerCase();
+const FAX_SENDERS = (process.env.FAX_SENDERS || "")
+  .toLowerCase()
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const LOOKBACK_MINUTES = Number(process.env.LOOKBACK_MINUTES || 10);
 
 // ================== INIT ==================
@@ -168,7 +173,7 @@ async function upsertCaseByManagementNo(
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
 const deps = {
-  FAX_SENDER,
+  FAX_SENDERS,
   LOOKBACK_MINUTES,
   supabase,
   getGmail,
