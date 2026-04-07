@@ -113,7 +113,7 @@ export function registerIngestRoutes(app, deps) {
           const fromEmail = (addrMatch ? addrMatch[1] : (from || ""))
             .trim()
             .toLowerCase();
-          const messageType = FAX_SENDER && fromEmail === FAX_SENDER ? "fax" : "mail";
+          const messageType = FAX_SENDERS.includes(fromEmail) ? "fax" : "mail";
 
           const threadId = full.data.threadId || id;
           const managementNo = `gmail_${threadId}`;
