@@ -26,7 +26,7 @@ function b64UrlToBuffer(b64url) {
 
 export function registerIngestRoutes(app, deps) {
   const {
-    FAX_SENDER,
+    FAX_SENDERS,
     LOOKBACK_MINUTES,
     supabase,
     getGmail,
