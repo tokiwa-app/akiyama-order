@@ -170,8 +170,6 @@ export function registerIngestRoutes(app, deps) {
               });
 
             if (insMsgErr) throw insMsgErr;
-
-
           }
 
           // 3) 添付保存（既存ロジックそのまま：GCS）
